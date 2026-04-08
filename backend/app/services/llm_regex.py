@@ -85,13 +85,19 @@ Multiple OCR examples on ONE entity (several example lines with different label=
 - If **label=** strings **differ** between examples (e.g. one says "New Balance", another "Statement Balance as of …"), a regex that only matches **one** of those phrases is **wrong**. You must use **alternation** of the distinct label/landmark phrases (or a shared parent landmark) so that the **value** from **each** example would be captured. Escaping: quote minimal distinctive substrings; use IGNORECASE if casing varies.
 - If **landmark=** differs between examples (e.g. "Summary of Account Activity" vs "Payment Information"), the layouts are different: consider alternation that includes **both** landmark+label+value paths, or a regex whose anchors reflect each pair — do not silently drop a landmark from a non-primary example.
 - In rationale or confidence_notes, briefly state that the pattern covers each listed source/example (or explain which layout is out of scope).
+
+Bbox / annotate picks (user drew boxes on the page):
+- The UI sends landmark/label/value **strings** from OCR boxes. Flattened document text is often **one long stream**; reading order may place **other words between** the label and the value even when they look adjacent on the image.
+- A pattern that is only label-then-whitespace-then-value is often **wrong** unless a **Focused OCR slice** below shows that exact adjacency.
+- When the slice shows filler between label and value, use a **conservative** non-greedy gap between literals and the capture (e.g. `[\\s\\S]{0,200}?` — raise the number only as needed from what you see, stay under ~500). Or anchor **landmark** then **label** then value. Set `flags` to include DOTALL if newlines appear in the gap. Avoid greedy `.*` spanning the whole page.
+- If landmark and label both appear in the slice, prefer ordering them as in the slice before the value capture.
 """
 
 USER_TEMPLATE = """Document text (one or more samples; may be truncated):
 ---
 {text}
 ---
-
+{annotation_focus}
 For each entity below, produce ONE primary regex pattern that would generalize to similar documents (same vendor/layout family), not only this page.
 When the document text or examples show how the label connects to the value (spaces, $, comma decimals, colons), reflect that in the regex.
 If an entity lists multiple examples with **different** label= text, your single pattern must match **all** of those label→value shapes (use (?:...|...) over labels or landmarks); do not output a pattern that only fits the first example.
@@ -151,6 +157,96 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
             + (("\n" + "\n".join(ex_lines)) if ex_lines else "")
         )
     return "\n".join(lines)
+
+
+def _local_snippet_for_phrases(
+    text: str,
+    phrases: list[str],
+    *,
+    padding: int = 160,
+    max_span: int = 1200,
+) -> str | None:
+    """
+    Smallest span of ``text`` covering first occurrence of each given phrase (bbox OCR strings),
+    with padding. Used so the LLM sees real linear order between landmark/label/value.
+    """
+    text = text or ""
+    spans: list[tuple[int, int]] = []
+    for p in phrases:
+        p = (p or "").strip()
+        if len(p) < 2:
+            continue
+        i = text.find(p)
+        if i >= 0:
+            spans.append((i, i + len(p)))
+    if not spans:
+        return None
+    lo = max(0, min(s[0] for s in spans) - padding)
+    hi = min(len(text), max(s[1] for s in spans) + padding)
+    if hi - lo > max_span:
+        mid = (lo + hi) // 2
+        half = max_span // 2
+        lo = max(0, mid - half)
+        hi = min(len(text), lo + max_span)
+    return text[lo:hi]
+
+
+def _build_annotation_focus_sections(
+    primary: str,
+    additional: list[str] | None,
+    entities: list[EntitySpec],
+) -> str:
+    """
+    For each saved bbox example, attach a short slice of the document where all non-empty
+    phrases appear (primary first, then first additional doc that contains them).
+    """
+    add = [t.strip() for t in (additional or []) if t and t.strip()]
+    chunks: list[str] = []
+    for e in entities:
+        examples = getattr(e, "examples", None) or []
+        for k, ex in enumerate(examples, 1):
+            if not isinstance(ex, dict):
+                continue
+            phrases: list[str] = []
+            for key in ("landmark", "label", "value"):
+                v = ex.get(key)
+                if v and str(v).strip():
+                    phrases.append(str(v).strip())
+            if not phrases:
+                continue
+            seen: set[str] = set()
+            uniq: list[str] = []
+            for p in phrases:
+                if p not in seen:
+                    seen.add(p)
+                    uniq.append(p)
+            phrases = uniq
+            placed = False
+            for blob, blabel in [(primary, "primary document")] + [
+                (t, f"additional document {i + 1}") for i, t in enumerate(add)
+            ]:
+                if not blob:
+                    continue
+                sn = _local_snippet_for_phrases(blob, phrases)
+                if sn:
+                    chunks.append(
+                        f"--- Focus slice for «{e.name}» (OCR example {k}; {blabel}) ---\n{sn}"
+                    )
+                    placed = True
+                    break
+            if not placed:
+                logger.debug(
+                    "No focus slice for entity %r example %s (phrases not found in any doc)",
+                    e.name,
+                    k,
+                )
+    if not chunks:
+        return ""
+    intro = (
+        "Focused OCR slices (linear text around your bbox phrase hits). "
+        "Check filler between landmark / label / value here — not only the examples list.\n\n"
+    )
+    return "\n" + intro + "\n\n".join(chunks) + "\n\n"
 
 
 def _ollama_error_from_body(data: Any) -> str | None:
@@ -513,6 +609,11 @@ async def generate_regex_patterns(
 ) -> RegexGenerateResponse:
     model_name = model or DEFAULT_LLM_MODEL
     text = _combine_document_samples(full_text, additional_full_texts)
+    annotation_focus = _build_annotation_focus_sections(
+        full_text.strip(),
+        additional_full_texts,
+        entities,
+    )
     entity_block = _build_entity_block(entities)
     extra = ""
     if extra_instructions.strip():
@@ -520,6 +621,7 @@ async def generate_regex_patterns(
 
     user_content = USER_TEMPLATE.format(
         text=text,
+        annotation_focus=annotation_focus,
         entity_block=entity_block,
         extra=extra,
     )
