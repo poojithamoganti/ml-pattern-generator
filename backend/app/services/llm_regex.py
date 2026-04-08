@@ -58,6 +58,10 @@ SYSTEM_PROMPT = """You are an expert at writing portable, reusable regular expre
 Rules:
 - Target runtime is Python 3 `re` only (what you put in "pattern" is passed to re.compile). Not PCRE, not Perl, not JavaScript.
 - FORBIDDEN in patterns (will not work): \\\\K (keep/drop match — PCRE only), (?R) recursion, branch-reset (?|...). Use capturing groups () or non-capturing (?:...) instead.
+- Prefer anchor-based patterns that capture values near a label/anchor phrase.
+  - If the entity has a clear label in the text (often similar to the entity name), include that label as a literal anchor in the regex.
+  - Keep the distance between label and value small (typically same line; allow limited dot-leaders/spaces between them).
+  - Avoid patterns that would match any date/amount anywhere on the page without context.
 - Prefer simple patterns: word boundaries \\\\b, digit runs \\\\d+, optional groups (...)?, and labeled context like Account\\\\s*Number:\\\\s*(\\\\d{16}) when the document shows that layout.
 - Prefer character classes, quantifiers, and optional groups over copying long fixed strings.
 - Anchor only when it improves precision on *similar* documents (invoice-like layouts), not one-off literals.
@@ -158,6 +162,78 @@ def _annotate_python_re_warnings(items: list[RegexPatternItem]) -> list[RegexPat
         cn = (it.confidence_notes or "").strip()
         merged = f"{cn} {suffix}".strip() if cn else suffix
         out.append(it.model_copy(update={"confidence_notes": merged}))
+    return out
+
+
+def _anchor_words_for_entity(e: EntitySpec) -> set[str]:
+    """
+    Extract anchor words from entity name and any quoted phrases in hints.
+    These are used to reject patterns that are too broad (e.g. 'any date anywhere').
+    """
+    words: set[str] = set()
+    # Entity name words
+    for w in re.findall(r"[A-Za-z]{3,}", e.name or ""):
+        words.add(w.lower())
+    # Quoted phrases in hints: "..." or '...'
+    for m in re.finditer(r"['\"]([^'\"]{3,})['\"]", e.hints or ""):
+        for w in re.findall(r"[A-Za-z]{3,}", m.group(1)):
+            words.add(w.lower())
+    return words
+
+
+def _pattern_has_anchor(pattern: str, anchor_words: set[str]) -> bool:
+    """
+    Heuristic: require at least one readable anchor token to prevent global matches.
+    - If the pattern contains no letters at all, it's almost certainly unanchored.
+    - If we have anchor_words, require intersection with literal-ish tokens in the pattern.
+    """
+    if not pattern or not pattern.strip():
+        return False
+    if not re.search(r"[A-Za-z]", pattern):
+        return False
+    # Extract alphabetic tokens present in the regex itself.
+    toks = {t.lower() for t in re.findall(r"[A-Za-z]{3,}", pattern)}
+    if not toks:
+        return False
+    if not anchor_words:
+        # No anchor hint available; at least having letters is better than pure numeric patterns.
+        return True
+    return bool(toks & anchor_words)
+
+
+def _enforce_anchor_based(
+    patterns: list[RegexPatternItem], entities: list[EntitySpec]
+) -> list[RegexPatternItem]:
+    """
+    Ensure each entity pattern is anchored to nearby label text.
+    If a pattern is too broad, blank it and explain what anchor words are needed.
+    """
+    by_name = {e.name: e for e in entities}
+    out: list[RegexPatternItem] = []
+    for p in patterns:
+        e = by_name.get(p.entity)
+        if e is None:
+            out.append(p)
+            continue
+        anchors = _anchor_words_for_entity(e)
+        if _pattern_has_anchor(p.pattern, anchors):
+            out.append(p)
+            continue
+        want = ", ".join(sorted(list(anchors))[:6])
+        note = (
+            f"Too broad / missing anchor. Include label words near the value"
+            + (f" (e.g. {want})." if want else ". Add quoted label text in hints.")
+        )
+        out.append(
+            p.model_copy(
+                update={
+                    "pattern": "",
+                    "flags": "",
+                    "rationale": "Rejected: pattern was not anchor-based.",
+                    "confidence_notes": note,
+                }
+            )
+        )
     return out
 
 
@@ -408,6 +484,7 @@ async def generate_regex_patterns(
         ) from e
 
     patterns = _parse_patterns_from_raw(raw, entities)
+    patterns = _enforce_anchor_based(patterns, entities)
     return RegexGenerateResponse(
         patterns=patterns,
         raw_model_text=raw,
