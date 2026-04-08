@@ -59,9 +59,9 @@ Rules:
 - Target runtime is Python 3 `re` only (what you put in "pattern" is passed to re.compile). Not PCRE, not Perl, not JavaScript.
 - FORBIDDEN in patterns (will not work): \\\\K (keep/drop match — PCRE only), (?R) recursion, branch-reset (?|...). Use capturing groups () or non-capturing (?:...) instead.
 - Prefer anchor-based patterns that capture values near a label/anchor phrase.
-  - If the entity has a clear label in the text (often similar to the entity name), include that label as a literal anchor in the regex.
+  - Anchors should come from the **user's example lines** (label=, landmark=) and document text — the entity **name** is only a display title; another PDF may use a different phrase (e.g. "Statement Balance as of …" instead of "New Balance"). Do **not** assume the entity name appears verbatim in OCR.
   - Keep the distance between label and value small (typically same line; allow limited dot-leaders/spaces between them).
-  - Between label and value, copy what you actually see in the Document text or in the user's examples: if the line shows a dollar sign or spaces but no colon, do not require a colon; if the document uses "Key: value", mirror that. Do not assume ": " after a label unless it appears there.
+  - Between label and value, copy what you actually see in the Document text or in the user's examples: if the line shows a dollar sign or spaces but no colon, do not require a colon; if the document uses "Key: value", mirror that. Do not assume ": " after a label unless it appears there. If one example has `$` before the amount and another does not, use optional `\\\\$?` (or similar) so both match.
   - Avoid patterns that would match any date/amount anywhere on the page without context.
 - Prefer simple patterns: word boundaries \\\\b, digit runs \\\\d+, optional groups (...)?, and labeled context like Account\\\\s*Number:\\\\s*(\\\\d{16}) when the document shows that layout.
 - Prefer character classes, quantifiers, and optional groups over copying long fixed strings.
@@ -80,6 +80,10 @@ Multi-sample documents:
 - You may see several "Sample document" blocks (different PDFs or layout variants). Produce ONE regex per entity that extracts the same logical field across those variants when possible.
 - Use alternation (?:A|B), optional groups (...)?, or character classes to cover real differences (e.g. with/without colon, $ vs no currency symbol) without matching random amounts elsewhere.
 - If two layouts cannot be unified safely, prefer precision over recall and explain tradeoffs in confidence_notes.
+
+Multiple OCR examples on ONE entity (several example lines with different label= or landmark=):
+- If **label=** strings **differ** between examples (e.g. one says "New Balance", another "Statement Balance as of …"), a regex that only matches **one** of those phrases is **wrong**. You must use **alternation** of the distinct label/landmark phrases (or a shared parent landmark) so that the **value** from **each** example would be captured. Escaping: quote minimal distinctive substrings; use IGNORECASE if casing varies.
+- In rationale or confidence_notes, briefly state that the pattern covers each listed source/example (or explain which layout is out of scope).
 """
 
 USER_TEMPLATE = """Document text (one or more samples; may be truncated):
@@ -89,6 +93,7 @@ USER_TEMPLATE = """Document text (one or more samples; may be truncated):
 
 For each entity below, produce ONE primary regex pattern that would generalize to similar documents (same vendor/layout family), not only this page.
 When the document text or examples show how the label connects to the value (spaces, $, comma decimals, colons), reflect that in the regex.
+If an entity lists multiple examples with **different** label= text, your single pattern must match **all** of those label→value shapes (use (?:...|...) over labels or landmarks); do not output a pattern that only fits the first example.
 
 Entities:
 {entity_block}
@@ -133,7 +138,11 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
             f"   occurrence: {occ}\n"
             f"   layout / position hints: {hints}"
             + (
-                ("\n   Multiple OCR examples below may come from different PDFs; synthesize ONE pattern that fits all.")
+                (
+                    "\n   Multiple OCR examples below may come from different PDFs. "
+                    "If the label= (or landmark+) strings are NOT the same across examples, "
+                    "use alternation so EACH example's value shape is reachable — do not anchor only on the entity display name or on the first example's label."
+                )
                 if multi
                 else ""
             )
