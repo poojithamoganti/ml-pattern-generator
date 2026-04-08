@@ -66,11 +66,13 @@ Rules:
 - Prefer simple patterns: word boundaries \\\\b, digit runs \\\\d+, optional groups (...)?, and labeled context like Account\\\\s*Number:\\\\s*(\\\\d{16}) when the document shows that layout.
 - Prefer character classes, quantifiers, and optional groups over copying long fixed strings.
 - Anchor only when it improves precision on *similar* documents (invoice-like layouts), not one-off literals.
+- **Alternation `(?:A|B|…)`:** Use **only** for **different label or landmark wordings** of the *same* logical field. **Never** use alternation to enumerate **values** seen on this page (person names, merchants, bank headers, one-off amounts) — those will not generalize.
 - **Person / customer / cardholder names (when the entity is a human name, not an account number):**
   - Anchor on **field labels only** — phrases like `Customer\\\\s*Name`, `Name\\\\s*on\\\\s*Account`, `Cardholder`, `Account\\\\s*Holder` — taken from the user's label=/hints or visible recurring statement wording. Use alternation **only across real label variants**, not across **values** read from the page.
   - **Forbidden:** Do not add alternation branches made of **merchant names, bank names (e.g. SYNCHRONY), store names, or the cardholder's actual name** — those are **data**, not labels. Another statement will have different names; the regex must still work.
-  - **Capture** the name with a **generic** shape, e.g. two or more name tokens: `(?i)(?:Customer\\\\s*Name|Cardholder(?:\\\\s*Name)?|Name\\\\s*on\\\\s*Account)\\\\s*:?\\\\s*([A-Za-z][A-Za-z'\\\\-.]*(?:\\\\s+[A-Za-z][A-Za-z'\\\\-.]*)+)` — tune spacing/colons from the document. Optional middle initial: allow `\\\\b[A-Z]\\\\.\\\\s*` between tokens. Do **not** use `(?:CAROL|TOLBERT|...)` style lists.
+  - **Capture** the name with a **generic** shape after the label (often `(?i)` because statements are **ALL CAPS** in OCR): e.g. `([A-Za-z][A-Za-z'\\\\-.]*(?:\\\\s+[A-Za-z][A-Za-z'\\\\-.]*)+)` or similar — tune spacing/colons from the document. Optional middle initial between tokens. Do **not** use `(?:CAROL|TOLBERT|...)` style lists.
   - **One entity = one field.** Do not OR together unrelated fields (e.g. "Account Number" digit capture and "Customer Name" text) in a single pattern; use separate entities.
+- **OCR checklist (scanned PDFs / statements):** Colons are often missing — use `\\\\s*:?\\\\s*` between label and value when needed. Amounts: optional `\\\\$?` or `[$sS]?` before digits if `$` is missing or misread. Label and value may be on **different lines** — allow `\\\\n?` or a **short** non-greedy gap `[\\\\s\\\\S]{0,200}?` with **DOTALL** if needed; never greedy `.*` across the whole page. For noisy ID digits, optional **single-position** classes like `[0O]` are OK; do not blindly replace every `\\\\d`.
 - For DOTALL or IGNORECASE, say so in "flags" (e.g. IGNORECASE, DOTALL).
 - Output must be a single JSON object: a "patterns" array. Each item: entity (exact user label), pattern, flags, rationale, confidence_notes — use "" for unused string fields.
 - Each "pattern" value is a normal JSON string only. NEVER prefix with r or r" — invalid JSON. Never write pattern": r"
@@ -148,6 +150,32 @@ def _name_entity_instruction(e: EntitySpec) -> str:
     )
 
 
+def _kind_hint_for_entity(e: EntitySpec) -> str:
+    """
+    Short per-kind reminders aligned with UI ENTITY_KINDS (text, date, amount, currency, …).
+    Skipped when _name_entity_instruction already added a stronger name block.
+    """
+    if _name_entity_instruction(e):
+        return ""
+    k = (e.kind or "text").strip().lower() or "text"
+    lines: dict[str, str] = {
+        "amount": "**Kind amount:** Anchor on amount/balance label; optional `\\\\$?` or `[$sS]?` before digits; thousands commas as in the doc.",
+        "currency": "**Kind currency:** Same as amount — symbol often missing or misread as S/s after the label.",
+        "date": "**Kind date:** Allow separators `[/\\\\-.]`; anchor near a date label — not every date on the page.",
+        "number": "**Kind number:** Digit runs (and allowed punctuation); narrow label anchor so you do not grab unrelated numbers.",
+        "id": "**Kind ID/reference:** Anchor on account/ref labels; shape from examples — one field per entity, no mixing unrelated patterns.",
+        "email": "**Kind email:** Typical `[^\\\\s@]+@[^\\\\s@]+`; anchor if a label exists.",
+        "phone": "**Kind phone:** Digits and separators as in OCR; anchor near phone wording if present.",
+        "address": "**Kind address:** May span lines — DOTALL + bounded gap after label if the slice shows breaks.",
+        "other": "**Kind other:** Label anchor + value shape from examples; no value-list alternation.",
+        "text": "**Kind text:** Label anchor + generic value shape; alternation only for label variants, not OCR snippets.",
+    }
+    msg = lines.get(k)
+    if not msg:
+        return ""
+    return f"\n   {msg}"
+
+
 def _build_entity_block(entities: list[EntitySpec]) -> str:
     lines: list[str] = []
     for i, e in enumerate(entities, 1):
@@ -177,12 +205,14 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
                 ex_lines.append(f"   example {j}: " + " ; ".join(parts))
         multi = len(ex_lines) > 1
         name_extra = _name_entity_instruction(e)
+        kind_extra = _kind_hint_for_entity(e)
         lines.append(
             f"{i}. name: {e.name}\n"
             f"   expected type: {kind}\n"
             f"   occurrence: {occ}\n"
             f"   layout / position hints: {hints}"
             + name_extra
+            + kind_extra
             + (
                 (
                     "\n   Multiple OCR examples below may come from different PDFs. "
@@ -556,12 +586,14 @@ Rules:
 **Portable patterns (do not overfit this page):**
 - Do **not** build alternations of **specific values** seen in the OCR: person names, surnames, partial account numbers, or one-off words — unless they are stable **field labels** that repeat on every similar statement (e.g. "New Balance", "Statement Closing Date"). Wrong: `(?:Carol|Smith|Tolbert|...)`, or `(?:PANDORA|BANK|CAROL|...)`. Right: anchor on the label phrase (from hints or visible text) and capture the **value** with a generic shape (e.g. name-like `[\w'.-]+(?:\s+[\w'.-]+)+`, date `\\\\d{1,2}/\\\\d{1,2}/\\\\d{4}`, money with separators).
 - **Customer / cardholder name entities:** Never OR **bank or merchant header lines** into the pattern — they are not field labels. Never combine **Account Number** (digits) and **Customer Name** in one regex; those are different fields. Use label-only anchors + generic multi-word name capture (see kind=hints).
-- If `findall` already returns sensible captures, **keep** the pattern or change the **minimum** needed. Do not add extra literals "to be safe."
+
+**Non-empty `findall` is NOT always correct:** If matches look like **headers, footers, or the wrong field** (e.g. merchant line vs cardholder name; digits vs name), or the pattern contains long `|` lists of **page-specific tokens**, **rewrite** to label + generic value capture — even when `findall` returned something. Prefer semantic fit to **kind** over match count.
+- If `findall` already returns **correct** captures for the intended field and the pattern generalizes (no value-list OR), **keep** it or change the **minimum** needed.
 - If `findall` is empty or errors: fix using **label/landmark** text in the OCR plus value shape classes — never "patch" by enumerating example values from the document.
 
-**OCR noise:** Near currency/amount labels, `$` is often misread as `s` or `S`. After a clear amount label anchor, allow an optional currency glitch before digits, e.g. `(?:[$\\\\s]|(?<![A-Za-z])[sS])(?=\d)` or a tight `[$sS]?` **only** in the amount position after the label — avoid bare `s` that match unrelated text.
+**OCR (refinement):** Optional colons: `\\\\s*:?\\\\s*` between label and value. Amounts: optional `[$sS]?` or `\\\\$?` after label before digits. Newlines between label and value: `\\\\n?` or short `[\\\\s\\\\S]{0,200}?` with DOTALL. `$` near amounts often misread as `s`/`S` — tight optional prefix after the label only.
 
-**Anchoring:** Prefer label phrases + value shape over global date/amount scans. Briefly note substantive edits in rationale or confidence_notes.
+**Anchoring:** Prefer label phrases + value shape over global scans. Briefly note substantive edits in rationale or confidence_notes.
 """
 
 
@@ -603,6 +635,9 @@ def _build_refinement_entity_context(entities: list[EntitySpec]) -> str:
         ni = _name_entity_instruction(e).strip()
         if ni:
             lines.append(f"  → {ni}")
+        kh = _kind_hint_for_entity(e).strip()
+        if kh:
+            lines.append(f"  → {kh}")
     return "\n".join(lines) if lines else "(none)"
 
 
