@@ -66,6 +66,11 @@ Rules:
 - Prefer simple patterns: word boundaries \\\\b, digit runs \\\\d+, optional groups (...)?, and labeled context like Account\\\\s*Number:\\\\s*(\\\\d{16}) when the document shows that layout.
 - Prefer character classes, quantifiers, and optional groups over copying long fixed strings.
 - Anchor only when it improves precision on *similar* documents (invoice-like layouts), not one-off literals.
+- **Person / customer / cardholder names (when the entity is a human name, not an account number):**
+  - Anchor on **field labels only** — phrases like `Customer\\\\s*Name`, `Name\\\\s*on\\\\s*Account`, `Cardholder`, `Account\\\\s*Holder` — taken from the user's label=/hints or visible recurring statement wording. Use alternation **only across real label variants**, not across **values** read from the page.
+  - **Forbidden:** Do not add alternation branches made of **merchant names, bank names (e.g. SYNCHRONY), store names, or the cardholder's actual name** — those are **data**, not labels. Another statement will have different names; the regex must still work.
+  - **Capture** the name with a **generic** shape, e.g. two or more name tokens: `(?i)(?:Customer\\\\s*Name|Cardholder(?:\\\\s*Name)?|Name\\\\s*on\\\\s*Account)\\\\s*:?\\\\s*([A-Za-z][A-Za-z'\\\\-.]*(?:\\\\s+[A-Za-z][A-Za-z'\\\\-.]*)+)` — tune spacing/colons from the document. Optional middle initial: allow `\\\\b[A-Z]\\\\.\\\\s*` between tokens. Do **not** use `(?:CAROL|TOLBERT|...)` style lists.
+  - **One entity = one field.** Do not OR together unrelated fields (e.g. "Account Number" digit capture and "Customer Name" text) in a single pattern; use separate entities.
 - For DOTALL or IGNORECASE, say so in "flags" (e.g. IGNORECASE, DOTALL).
 - Output must be a single JSON object: a "patterns" array. Each item: entity (exact user label), pattern, flags, rationale, confidence_notes — use "" for unused string fields.
 - Each "pattern" value is a normal JSON string only. NEVER prefix with r or r" — invalid JSON. Never write pattern": r"
@@ -111,6 +116,38 @@ Return JSON with a "patterns" array only (no markdown). Each object: entity (exa
 Patterns must be valid Python `re` syntax (no \\\\K, no r" prefix — JSON string only)."""
 
 
+def _name_entity_instruction(e: EntitySpec) -> str:
+    """
+    Extra reminder when the entity title suggests a person/cardholder name field — reduces
+    bank/merchant/value alternation mistakes.
+    """
+    n = (e.name or "").lower()
+    if not n.strip():
+        return ""
+    looks_name = any(
+        p in n
+        for p in (
+            "customer name",
+            "cardholder",
+            "account holder",
+            "name on account",
+            "accountholder",
+            "full name",
+        )
+    ) or (
+        re.search(r"\bname\b", n)
+        and "number" not in n
+        and "account no" not in n
+        and "routing" not in n
+    )
+    if not looks_name:
+        return ""
+    return (
+        "\n   **This row is a human name field:** use label anchors + generic name capture only — "
+        "do not alternate bank/merchant strings or sample values from OCR; do not merge with Account Number."
+    )
+
+
 def _build_entity_block(entities: list[EntitySpec]) -> str:
     lines: list[str] = []
     for i, e in enumerate(entities, 1):
@@ -139,11 +176,13 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
             if parts:
                 ex_lines.append(f"   example {j}: " + " ; ".join(parts))
         multi = len(ex_lines) > 1
+        name_extra = _name_entity_instruction(e)
         lines.append(
             f"{i}. name: {e.name}\n"
             f"   expected type: {kind}\n"
             f"   occurrence: {occ}\n"
             f"   layout / position hints: {hints}"
+            + name_extra
             + (
                 (
                     "\n   Multiple OCR examples below may come from different PDFs. "
@@ -515,7 +554,8 @@ Rules:
 - Patterns must compile with Python `re`. Forbidden: \\\\K, (?R). Pattern values are JSON strings with doubled backslashes.
 
 **Portable patterns (do not overfit this page):**
-- Do **not** build alternations of **specific values** seen in the OCR: person names, surnames, partial account numbers, or one-off words — unless they are stable **field labels** that repeat on every similar statement (e.g. "New Balance", "Statement Closing Date"). Wrong: `(?:Carol|Smith|Tolbert|...)`. Right: anchor on the label phrase (from hints or visible text) and capture the **value** with a generic shape (e.g. name-like `[\w'.-]+(?:\s+[\w'.-]+)+`, date `\\\\d{1,2}/\\\\d{1,2}/\\\\d{4}`, money with separators).
+- Do **not** build alternations of **specific values** seen in the OCR: person names, surnames, partial account numbers, or one-off words — unless they are stable **field labels** that repeat on every similar statement (e.g. "New Balance", "Statement Closing Date"). Wrong: `(?:Carol|Smith|Tolbert|...)`, or `(?:PANDORA|BANK|CAROL|...)`. Right: anchor on the label phrase (from hints or visible text) and capture the **value** with a generic shape (e.g. name-like `[\w'.-]+(?:\s+[\w'.-]+)+`, date `\\\\d{1,2}/\\\\d{1,2}/\\\\d{4}`, money with separators).
+- **Customer / cardholder name entities:** Never OR **bank or merchant header lines** into the pattern — they are not field labels. Never combine **Account Number** (digits) and **Customer Name** in one regex; those are different fields. Use label-only anchors + generic multi-word name capture (see kind=hints).
 - If `findall` already returns sensible captures, **keep** the pattern or change the **minimum** needed. Do not add extra literals "to be safe."
 - If `findall` is empty or errors: fix using **label/landmark** text in the OCR plus value shape classes — never "patch" by enumerating example values from the document.
 
@@ -560,6 +600,9 @@ def _build_refinement_entity_context(entities: list[EntitySpec]) -> str:
         hints = (e.hints or "").strip()
         hpart = f"\n    hints: {hints}" if hints else ""
         lines.append(f"- {e.name!r}: kind={k}, occurrence={occ}{hpart}")
+        ni = _name_entity_instruction(e).strip()
+        if ni:
+            lines.append(f"  → {ni}")
     return "\n".join(lines) if lines else "(none)"
 
 
