@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EntitySpec(BaseModel):
@@ -22,13 +22,31 @@ class EntitySpec(BaseModel):
 
 
 class RegexGenerateRequest(BaseModel):
-    full_text: str = Field(..., min_length=1, description="OCR/extracted document text")
+    full_text: str = Field(..., min_length=1, description="OCR/extracted document text (primary sample)")
+    additional_full_texts: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description="More OCR samples (e.g. other PDFs) so patterns generalize across layout variants",
+    )
     entities: list[EntitySpec] = Field(..., min_length=1)
     model: str | None = Field(default=None, description="Ollama model name")
     extra_instructions: str = Field(
         default="",
         description="User hints: dialect, case sensitivity, multiline, etc.",
     )
+
+    @field_validator("additional_full_texts", mode="before")
+    @classmethod
+    def _non_empty_extra_texts(cls, v: object) -> list[str]:
+        if not v:
+            return []
+        if not isinstance(v, list):
+            return []
+        out: list[str] = []
+        for item in v:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+        return out
 
 
 class RegexPatternItem(BaseModel):

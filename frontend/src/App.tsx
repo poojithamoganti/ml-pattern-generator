@@ -92,6 +92,8 @@ function normalizeForMatch(s: string): string {
 
 export default function App() {
   const [upload, setUpload] = useState<UploadResponse | null>(null)
+  /** Extra PDFs (text only) sent with generate for cross-document pattern synthesis */
+  const [extraSamples, setExtraSamples] = useState<Array<{ id: string; filename: string; full_text: string }>>([])
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [entities, setEntities] = useState<EntityForm[]>([
@@ -188,6 +190,43 @@ export default function App() {
       setBusyHint('')
     }
   }, [extractionMode, ocrEngine, ocrDpi, docMode, ocrDpiAnnotate])
+
+  const onExtraSample = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const f = e.target.files?.[0]
+      if (!f) return
+      if (extraSamples.length >= 12) {
+        setErr('You can add at most 12 extra sample PDFs.')
+        e.target.value = ''
+        return
+      }
+      setErr(null)
+      setBusy(true)
+      setBusyHint('Uploading extra sample PDF…')
+      try {
+        const u = await uploadPdf(f, {
+          extractionMode: extractionMode,
+          ocrEngine: ocrEngine,
+          ocrDpi: ocrDpi,
+        })
+        setExtraSamples((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), filename: u.filename, full_text: u.full_text },
+        ])
+      } catch (er: unknown) {
+        setErr(String(er))
+      } finally {
+        setBusy(false)
+        setBusyHint('')
+        e.target.value = ''
+      }
+    },
+    [extraSamples.length, extractionMode, ocrEngine, ocrDpi],
+  )
+
+  const removeExtraSample = useCallback((id: string) => {
+    setExtraSamples((prev) => prev.filter((s) => s.id !== id))
+  }, [])
 
   const onValidationFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
@@ -353,11 +392,14 @@ export default function App() {
     setErr(null)
     setBusy(true)
     setBusyHint(
-      'Ollama is generating regex — CPU inference can take several minutes on long text. Watch the timer below.',
+      extraSamples.length
+        ? `Ollama is generating from 1 primary + ${extraSamples.length} extra sample(s) — may take longer.`
+        : 'Ollama is generating regex — CPU inference can take several minutes on long text. Watch the timer below.',
     )
     try {
       const gen = await generateRegex({
         full_text: upload.full_text,
+        additional_full_texts: extraSamples.map((s) => s.full_text),
         entities: specs,
         model: model || null,
       })
@@ -511,7 +553,56 @@ export default function App() {
               </>
             )}
             {upload.full_text.length > 0 && ` · ${upload.full_text.length} characters`}
+            {extraSamples.length > 0 && ` · +${extraSamples.length} extra layout sample(s) for generation`}
           </p>
+        )}
+        {upload && (
+          <div className="extra-sample-block">
+            {extraSamples.length > 0 && (
+              <ul className="extra-samples">
+                {extraSamples.map((s) => (
+                  <li key={s.id}>
+                    <span title={`${s.full_text.length.toLocaleString()} characters`}>{s.filename}</span>
+                    <button
+                      type="button"
+                      className="btn secondary small"
+                      onClick={() => removeExtraSample(s.id)}
+                      disabled={busy}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="extra-sample-row">
+              <label className="file file-secondary">
+                <input
+                  type="file"
+                  accept="application/pdf"
+                  onChange={onExtraSample}
+                  disabled={busy || extraSamples.length >= 12}
+                />
+                <span>
+                  {extraSamples.length >= 12 ? 'Maximum 12 extra samples' : 'Add sample PDF (other layout)'}
+                </span>
+              </label>
+              {extraSamples.length > 0 && (
+                <button
+                  type="button"
+                  className="btn secondary"
+                  onClick={() => setExtraSamples([])}
+                  disabled={busy}
+                >
+                  Clear extra samples
+                </button>
+              )}
+            </div>
+            <p className="muted small">
+              Extra PDFs are only used as additional OCR text for &quot;Generate patterns&quot; — same entities, different
+              layouts (e.g. alternate New Balance lines).
+            </p>
+          </div>
         )}
         {upload && (
           <details className="preview" open>

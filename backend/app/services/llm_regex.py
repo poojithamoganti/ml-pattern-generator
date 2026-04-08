@@ -61,6 +61,7 @@ Rules:
 - Prefer anchor-based patterns that capture values near a label/anchor phrase.
   - If the entity has a clear label in the text (often similar to the entity name), include that label as a literal anchor in the regex.
   - Keep the distance between label and value small (typically same line; allow limited dot-leaders/spaces between them).
+  - Between label and value, copy what you actually see in the Document text or in the user's examples: if the line shows a dollar sign or spaces but no colon, do not require a colon; if the document uses "Key: value", mirror that. Do not assume ": " after a label unless it appears there.
   - Avoid patterns that would match any date/amount anywhere on the page without context.
 - Prefer simple patterns: word boundaries \\\\b, digit runs \\\\d+, optional groups (...)?, and labeled context like Account\\\\s*Number:\\\\s*(\\\\d{16}) when the document shows that layout.
 - Prefer character classes, quantifiers, and optional groups over copying long fixed strings.
@@ -74,14 +75,20 @@ Rules:
 Occurrence guidance:
 - If occurrence is "single": prefer a pattern that returns ONE match on a typical page (tight anchor + tight value shape).
 - If occurrence is "multiple": prefer a pattern that matches ALL intended occurrences (e.g. repeated rows), still anchored by a label/landmark or a header/row key. Avoid over-broad patterns that match unrelated values.
+
+Multi-sample documents:
+- You may see several "Sample document" blocks (different PDFs or layout variants). Produce ONE regex per entity that extracts the same logical field across those variants when possible.
+- Use alternation (?:A|B), optional groups (...)?, or character classes to cover real differences (e.g. with/without colon, $ vs no currency symbol) without matching random amounts elsewhere.
+- If two layouts cannot be unified safely, prefer precision over recall and explain tradeoffs in confidence_notes.
 """
 
-USER_TEMPLATE = """Document text (may be truncated):
+USER_TEMPLATE = """Document text (one or more samples; may be truncated):
 ---
 {text}
 ---
 
 For each entity below, produce ONE primary regex pattern that would generalize to similar documents (same vendor/layout family), not only this page.
+When the document text or examples show how the label connects to the value (spaces, $, comma decimals, colons), reflect that in the regex.
 
 Entities:
 {entity_block}
@@ -147,6 +154,35 @@ def _truncate(text: str, max_chars: int | None = None) -> str:
     head = max_chars // 2
     tail = max_chars - head
     return text[:head] + "\n\n[... truncated ...]\n\n" + text[-tail:]
+
+
+def _combine_document_samples(
+    primary: str,
+    additional: list[str] | None,
+    max_total: int | None = None,
+) -> str:
+    """
+    Merge primary OCR text with optional extra samples so the model sees multiple layouts.
+    Splits the character budget across chunks so each variant gets space in context.
+    """
+    max_total = max_total if max_total is not None else LLM_MAX_CHARS
+    extras = [t.strip() for t in (additional or []) if t and str(t).strip()]
+    if not extras:
+        return _truncate(primary.strip(), max_total)
+    n = 1 + len(extras)
+    per_doc = max(2000, max_total // n)
+    chunks: list[str] = [_truncate(primary.strip(), per_doc)]
+    for t in extras:
+        chunks.append(_truncate(t.strip(), per_doc))
+    parts: list[str] = [
+        f"--- Sample document 1 / {len(chunks)} (primary) ---\n{chunks[0]}",
+    ]
+    for i, c in enumerate(chunks[1:], start=2):
+        parts.append(f"\n\n--- Sample document {i} / {len(chunks)} (variant layout) ---\n{c}")
+    combined = "".join(parts)
+    if len(combined) > max_total:
+        combined = _truncate(combined, max_total)
+    return combined
 
 
 def _extract_json_string(raw: str) -> str:
@@ -453,9 +489,10 @@ async def generate_regex_patterns(
     entities: list[EntitySpec],
     model: str | None,
     extra_instructions: str,
+    additional_full_texts: list[str] | None = None,
 ) -> RegexGenerateResponse:
     model_name = model or DEFAULT_LLM_MODEL
-    text = _truncate(full_text)
+    text = _combine_document_samples(full_text, additional_full_texts)
     entity_block = _build_entity_block(entities)
     extra = ""
     if extra_instructions.strip():

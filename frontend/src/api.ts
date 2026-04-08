@@ -151,6 +151,8 @@ export async function validateRegex(body: {
 
 export async function generateRegex(body: {
   full_text: string
+  /** Extra OCR texts (e.g. other PDFs) so the model generalizes across layout variants */
+  additional_full_texts?: string[]
   entities: EntitySpec[]
   model: string | null
 }): Promise<RegexGenerateResponse> {

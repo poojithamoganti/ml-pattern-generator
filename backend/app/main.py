@@ -214,6 +214,7 @@ async def generate_regex_batch(body: RegexBatchRequest):
             body.entities,
             m,
             body.extra_instructions,
+            [],
         )
 
     try:
@@ -236,6 +237,7 @@ async def generate_regex(body: RegexGenerateRequest):
             body.entities,
             body.model,
             body.extra_instructions,
+            body.additional_full_texts,
         )
     except HTTPException:
         raise
