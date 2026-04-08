@@ -611,6 +611,7 @@ export default function App() {
     if (!result) return
     const payload = {
       ollama_model: result.ollama_model,
+      refinement_model: result.refinement_model || undefined,
       generated_at: new Date().toISOString(),
       patterns: result.patterns.map((p) => ({
         entity: p.entity,
@@ -619,6 +620,8 @@ export default function App() {
         rationale: p.rationale,
         confidence_notes: p.confidence_notes,
       })),
+      raw_generation: result.raw_model_text,
+      raw_refinement: result.refinement_raw_model_text || undefined,
     }
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: 'application/json;charset=utf-8',
@@ -1088,6 +1091,11 @@ export default function App() {
             Generate patterns
           </button>
         </div>
+        <p className="muted small model-refine-hint">
+          After generation, the API runs a <strong>refinement</strong> pass (default model{' '}
+          <code>qwen2.5:7b</code>) using real Python matches on your primary OCR — set{' '}
+          <code>OLLAMA_REFINEMENT_MODEL</code> in backend <code>.env</code> or use empty to disable.
+        </p>
       </section>
 
       {err && (
@@ -1113,7 +1121,10 @@ export default function App() {
               </button>
             </div>
           </div>
-          <p className="output-meta">Model: {result.ollama_model}</p>
+          <p className="output-meta">
+            Generator: {result.ollama_model}
+            {result.refinement_model ? ` · Refinement: ${result.refinement_model}` : ''}
+          </p>
           <ul className="patterns">
             {result.patterns.map((p) => (
               <li key={p.entity}>
@@ -1157,6 +1168,22 @@ export default function App() {
             </div>
             <pre className="raw">{prettyModelRaw(result.raw_model_text)}</pre>
           </details>
+          {result.refinement_model && result.refinement_raw_model_text && (
+            <details className="raw-debug">
+              <summary>Refinement model response ({result.refinement_model})</summary>
+              <div className="raw-debug-toolbar">
+                <button
+                  type="button"
+                  className="btn secondary btn-copy"
+                  onClick={() => copyPattern('__refine__', result.refinement_raw_model_text || '')}
+                  disabled={!result.refinement_raw_model_text?.trim()}
+                >
+                  {copiedEntity === '__refine__' ? 'Copied' : 'Copy refinement raw'}
+                </button>
+              </div>
+              <pre className="raw">{prettyModelRaw(result.refinement_raw_model_text)}</pre>
+            </details>
+          )}
         </section>
       )}
 

@@ -16,6 +16,9 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 # Ollama OpenAI-compatible API
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 DEFAULT_LLM_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+# Second pass: Python findall results + OCR → repair regex. Default qwen2.5:7b (strong instruction-following,
+# good for structured JSON / code-like fixes; different family from typical llama generator). Override via env or set to "" to disable.
+OLLAMA_REFINEMENT_MODEL = os.getenv("OLLAMA_REFINEMENT_MODEL", "qwen2.5:7b").strip()
 
 # Sent to Ollama as prompt context cap (smaller = faster; full PDF still in UI, LLM sees truncated slice)
 LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "12000"))

@@ -505,6 +505,148 @@ def _parse_patterns_from_raw(raw: str, entities: list[EntitySpec]) -> list[Regex
     return _annotate_python_re_warnings(loose)
 
 
+REFINEMENT_SYSTEM_PROMPT = """You are a regex repair assistant for Python 3 `re` (not PCRE).
+
+You receive first-pass patterns, primary OCR text, and real `re.findall` results plus any compile errors.
+
+Output: one JSON object with key "patterns" (array). Each item: entity (exact name from the user list), pattern, flags, rationale, confidence_notes.
+
+Rules:
+- Patterns must compile with Python `re`. Forbidden: \\\\K, (?R). Pattern values are JSON strings with doubled backslashes.
+- If findall already returns sensible captures, you may keep patterns unchanged or tighten only if clearly over-broad.
+- If findall is empty or regex errored, propose fixes that plausibly extract the intended values from this OCR text (anchor near labels/landmarks; avoid matching random dates/amounts globally).
+- Briefly note what you changed in rationale or confidence_notes.
+"""
+
+
+REFINEMENT_USER_TEMPLATE = """Primary document OCR (truncated; this is the same string used for findall):
+---
+{ocr}
+---
+
+First-pass patterns (JSON):
+{first_patterns_json}
+
+Python `re` evaluation on that OCR:
+Matches per entity (findall):
+{matches_json}
+
+Compile/runtime errors:
+{errors_json}
+
+Entity names (output patterns[].entity must match exactly):
+{names_list}
+
+Return JSON only: an object with a "patterns" array (same shape as above)."""
+
+
+def evaluate_patterns_on_ocr(
+    full_text: str, items: list[RegexPatternItem]
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Run the same logic as /api/validate-regex for use in the refinement pass."""
+    flags_map = {
+        "IGNORECASE": re.IGNORECASE,
+        "DOTALL": re.DOTALL,
+        "MULTILINE": re.MULTILINE,
+    }
+    matches: dict[str, list[str]] = {}
+    errors: dict[str, str] = {}
+    for p in items:
+        if not p.pattern.strip():
+            matches[p.entity] = []
+            continue
+        fl = 0
+        for part in re.split(r"[|,]", (p.flags or "")):
+            part = part.strip()
+            if part in flags_map:
+                fl |= flags_map[part]
+        try:
+            m = re.findall(p.pattern, full_text, fl)
+            if m and isinstance(m[0], tuple):
+                m = [x for t in m for x in t if x]
+            matches[p.entity] = m[:40] if isinstance(m, list) else [str(m)][:40]
+        except re.error as e:
+            matches[p.entity] = []
+            errors[p.entity] = str(e)
+    return matches, errors
+
+
+async def refine_regex_patterns_with_llm(
+    primary_ocr: str,
+    entities: list[EntitySpec],
+    first_pass: RegexGenerateResponse,
+    refinement_model: str,
+) -> RegexGenerateResponse:
+    """
+    Second LLM pass: sees actual Python match results on primary OCR and may repair patterns.
+    """
+    ocr = _truncate(primary_ocr.strip(), LLM_MAX_CHARS)
+    matches, errors = evaluate_patterns_on_ocr(primary_ocr, first_pass.patterns)
+    first_json = json.dumps(
+        [p.model_dump() for p in first_pass.patterns],
+        ensure_ascii=False,
+        indent=2,
+    )
+    matches_json = json.dumps(matches, ensure_ascii=False, indent=2)
+    errors_json = json.dumps(errors, ensure_ascii=False, indent=2)
+    names_list = ", ".join(repr(e.name) for e in entities)
+    user_content = REFINEMENT_USER_TEMPLATE.format(
+        ocr=ocr,
+        first_patterns_json=first_json,
+        matches_json=matches_json,
+        errors_json=errors_json,
+        names_list=names_list,
+    )
+    opts: dict[str, Any] = {"temperature": 0.05}
+    if LLM_NUM_CTX > 0:
+        opts["num_ctx"] = LLM_NUM_CTX
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    native_url = f"{OLLAMA_BASE_URL}/api/chat"
+    openai_url = f"{OLLAMA_BASE_URL}/v1/chat/completions"
+    raw = ""
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=OLLAMA_HTTP_TIMEOUT) as client:
+            if OLLAMA_STRUCTURED_JSON:
+                try:
+                    raw = await _fetch_native_structured(
+                        client, native_url, refinement_model, messages, opts
+                    )
+                    logger.info(
+                        "Refinement Ollama structured ok model=%s in %.1fs",
+                        refinement_model,
+                        time.perf_counter() - t0,
+                    )
+                except Exception as e:
+                    logger.warning("Refinement structured /api/chat failed: %s", e)
+            if not raw.strip():
+                raw = await _fetch_openai_compat(
+                    client, openai_url, refinement_model, messages, opts
+                )
+                logger.info(
+                    "Refinement Ollama OpenAI API model=%s in %.1fs",
+                    refinement_model,
+                    time.perf_counter() - t0,
+                )
+    except httpx.RequestError as e:
+        raise ValueError(
+            f"Refinement: cannot reach Ollama at {OLLAMA_BASE_URL}. {type(e).__name__}: {e!r}"
+        ) from e
+
+    refined_list = _parse_patterns_from_raw(raw, entities)
+    refined_list = _enforce_anchor_based(refined_list, entities)
+    return RegexGenerateResponse(
+        patterns=refined_list,
+        raw_model_text=first_pass.raw_model_text,
+        ollama_model=first_pass.ollama_model,
+        refinement_raw_model_text=raw,
+        refinement_model=refinement_model,
+    )
+
+
 async def _fetch_native_structured(
     client: httpx.AsyncClient,
     url: str,

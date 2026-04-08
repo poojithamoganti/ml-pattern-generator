@@ -616,6 +616,11 @@ label {
   margin-top: 0.35rem;
 }
 
+.model-refine-hint {
+  margin: 0.35rem 0 0;
+  max-width: 42rem;
+}
+
 .output-header {
   display: flex;
   flex-wrap: wrap;

@@ -21,6 +21,7 @@ from app.config import (
     OCR_ENGINE,
     OCR_USE_GPU,
     OLLAMA_BASE_URL,
+    OLLAMA_REFINEMENT_MODEL,
     UPLOAD_DIR,
 )
 from app.schemas import (
@@ -33,7 +34,7 @@ from app.schemas import (
     RegexValidateResponse,
     UploadResponse,
 )
-from app.services.llm_regex import generate_regex_patterns
+from app.services.llm_regex import generate_regex_patterns, refine_regex_patterns_with_llm
 from app.services.pdf_extract import extract_document, save_upload
 from app.services.ocr_boxes import ocr_boxes_for_upload
 
@@ -232,13 +233,25 @@ async def generate_regex(body: RegexGenerateRequest):
     if not body.entities:
         raise HTTPException(400, "At least one entity is required.")
     try:
-        return await generate_regex_patterns(
+        gen = await generate_regex_patterns(
             body.full_text,
             body.entities,
             body.model,
             body.extra_instructions,
             body.additional_full_texts,
         )
+        ref_model = (body.refinement_model or "").strip() or OLLAMA_REFINEMENT_MODEL
+        if ref_model:
+            try:
+                gen = await refine_regex_patterns_with_llm(
+                    body.full_text,
+                    body.entities,
+                    gen,
+                    ref_model,
+                )
+            except Exception as e:
+                logger.warning("Regex refinement pass failed; returning first-pass patterns only: %s", e)
+        return gen
     except HTTPException:
         raise
     except Exception as e:

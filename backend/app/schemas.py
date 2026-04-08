@@ -34,6 +34,10 @@ class RegexGenerateRequest(BaseModel):
         default="",
         description="User hints: dialect, case sensitivity, multiline, etc.",
     )
+    refinement_model: str | None = Field(
+        default=None,
+        description="Rare override for refinement model; server defaults to OLLAMA_REFINEMENT_MODEL (qwen2.5:7b).",
+    )
 
     @field_validator("additional_full_texts", mode="before")
     @classmethod
@@ -70,6 +74,8 @@ class RegexGenerateResponse(BaseModel):
     patterns: list[RegexPatternItem]
     raw_model_text: str = ""
     ollama_model: str = ""
+    refinement_raw_model_text: str = ""
+    refinement_model: str = ""
 
 
 class RegexBatchRequest(BaseModel):

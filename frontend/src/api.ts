@@ -132,6 +132,9 @@ export type RegexGenerateResponse = {
   patterns: RegexPatternItem[]
   raw_model_text: string
   ollama_model: string
+  /** Second-pass LLM (optional) */
+  refinement_raw_model_text?: string
+  refinement_model?: string
 }
 
 export type RegexValidateResponse = {
@@ -156,6 +159,8 @@ export async function generateRegex(body: {
   additional_full_texts?: string[]
   entities: EntitySpec[]
   model: string | null
+  /** Second Ollama model: validate/repair first-pass patterns on primary OCR */
+  refinement_model?: string | null
 }): Promise<RegexGenerateResponse> {
   return fetchJson(`${BASE}/api/generate-regex`, {
     method: 'POST',
