@@ -37,9 +37,10 @@ OCR_USE_GPU = os.getenv("OCR_USE_GPU", "1").lower() in ("1", "true", "yes")
 EXTRACTION_MODE = os.getenv("EXTRACTION_MODE", "scan").lower()
 
 # paddle: PP-Structure (layout + tables) — needs a clean env; see requirements-paddle.txt
-# easyocr: spatial reading order + tab gaps (default; works in typical torch/conda stacks)
-# docling: IBM Docling pipeline — optional; pip install -r requirements-docling.txt
-OCR_ENGINE = os.getenv("OCR_ENGINE", "easyocr").lower()
+# easyocr: spatial reading order + tab gaps (works in typical torch/conda stacks)
+# docling: IBM Docling pipeline (default when installed; cleaner OCR than EasyOCR for many PDFs)
+#   Without docling package, pdf_extract falls back to EasyOCR — see requirements-docling.txt
+OCR_ENGINE = os.getenv("OCR_ENGINE", "docling").lower()
 
 # Higher DPI helps thin rules and small type in tables (GPU recommended)
 OCR_DPI = int(os.getenv("OCR_DPI", "300"))

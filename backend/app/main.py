@@ -149,7 +149,7 @@ async def upload_pdf(
     mode = (extraction_mode or EXTRACTION_MODE or "scan").lower()
     if mode not in ("scan", "auto", "embedded"):
         raise HTTPException(400, "extraction_mode must be scan, auto, or embedded.")
-    engine = (ocr_engine or OCR_ENGINE or "paddle").lower()
+    engine = (ocr_engine or OCR_ENGINE or "docling").lower()
     if engine not in ("paddle", "easyocr", "docling"):
         raise HTTPException(400, "ocr_engine must be paddle, easyocr, or docling.")
     dpi = int(ocr_dpi) if ocr_dpi is not None else OCR_DPI

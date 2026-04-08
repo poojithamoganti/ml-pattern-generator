@@ -221,7 +221,7 @@ export default function App() {
   const [copiedEntity, setCopiedEntity] = useState<string | null>(null)
   const [rawPanelOpen, setRawPanelOpen] = useState(true)
   const [extractionMode, setExtractionMode] = useState<'scan' | 'auto' | 'embedded'>('scan')
-  const [ocrEngine, setOcrEngine] = useState<'paddle' | 'easyocr' | 'docling'>('easyocr')
+  const [ocrEngine, setOcrEngine] = useState<'paddle' | 'easyocr' | 'docling'>('docling')
   const [ocrDpi, setOcrDpi] = useState(300)
   const [docMode, setDocMode] = useState<'text' | 'annotate'>('text')
   const [ocrPage, setOcrPage] = useState(1)
