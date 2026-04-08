@@ -76,6 +76,20 @@ function docLabelForAnnotate(
   return s ? `Sample — ${s.filename}` : `Primary — ${upload.filename}`
 }
 
+/** Full hints text derived only from saved examples — one block per PDF so every landmark appears. */
+function buildHintsFromSavedExamples(examples: SavedPickExample[]): string {
+  if (!examples.length) return ''
+  return examples
+    .map((ex) => {
+      const lines: string[] = [`OCR example [${ex.sourceLabel}]`]
+      if (ex.landmark?.text) lines.push(`Landmark: "${ex.landmark.text}"`)
+      if (ex.label?.text) lines.push(`Label: "${ex.label.text}"`)
+      if (ex.value?.text) lines.push(`Value: "${ex.value.text}"`)
+      return lines.join('\n')
+    })
+    .join('\n\n')
+}
+
 function picksToApiDraft(row: EntityForm): ApiExample | null {
   if (!row.picked_landmark && !row.picked_label && !row.picked_value) return null
   return {
@@ -471,35 +485,22 @@ export default function App() {
       prev.map((r) => {
         if (r.id !== activePick.entityId) return r
         if (activePick.field === 'landmark') {
-          const nextHints = r.hints.includes('Landmark:')
-            ? r.hints
-            : `${r.hints}${r.hints.trim() ? '\n' : ''}Landmark: "${box.text}"`
           return {
             ...r,
             picked_landmark: { text: box.text, box_id: box.id, page: box.page },
-            hints: nextHints,
             pickSourceLabel: pickSrc,
           }
         }
         if (activePick.field === 'label') {
-          const nextHints = r.hints.includes('"')
-            ? r.hints
-            : `${r.hints}${r.hints.trim() ? '\n' : ''}Label text: "${box.text}"`
           return {
             ...r,
             picked_label: { text: box.text, box_id: box.id, page: box.page },
-            hints: nextHints,
             pickSourceLabel: pickSrc,
           }
         }
-        const nextHints =
-          r.hints.trim().length === 0
-            ? `Example value: "${box.text}"`
-            : `${r.hints}\nExample value: "${box.text}"`
         return {
           ...r,
           picked_value: { text: box.text, box_id: box.id, page: box.page },
-          hints: nextHints,
           pickSourceLabel: pickSrc,
         }
       }),
@@ -519,9 +520,11 @@ export default function App() {
           label: r.picked_label,
           value: r.picked_value,
         }
+        const nextExamples = [...(r.examples || []), nextEx]
         return {
           ...r,
-          examples: [...(r.examples || []), nextEx],
+          examples: nextExamples,
+          hints: buildHintsFromSavedExamples(nextExamples),
           picked_landmark: undefined,
           picked_label: undefined,
           picked_value: undefined,
@@ -537,7 +540,7 @@ export default function App() {
         if (r.id !== entityId) return r
         const next = [...(r.examples || [])]
         next.splice(index, 1)
-        return { ...r, examples: next }
+        return { ...r, examples: next, hints: buildHintsFromSavedExamples(next) }
       }),
     )
   }
@@ -1047,11 +1050,16 @@ export default function App() {
               <label className="entity-hints-label">
                 Hints (position, column, layout, format)
                 <textarea
-                  placeholder="e.g. top-right of first page, next to label ‘Balance’, table column 3"
+                  placeholder="e.g. top-right of first page, table column 3. After you save OCR picks, landmark/label/value from every PDF are listed here — add extra notes if needed."
                   value={row.hints}
                   onChange={(e) => updateEntity(row.id, { hints: e.target.value })}
-                  rows={2}
+                  rows={Math.min(14, Math.max(3, row.hints.split('\n').length + 1))}
                 />
+                {(row.examples?.length ?? 0) > 0 && (
+                  <span className="hints-sync-note">
+                    Auto-filled from saved examples (each PDF’s landmark, label, value). Edit freely to add notes.
+                  </span>
+                )}
               </label>
             </div>
           ))}

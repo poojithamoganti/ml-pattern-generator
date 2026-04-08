@@ -83,6 +83,7 @@ Multi-sample documents:
 
 Multiple OCR examples on ONE entity (several example lines with different label= or landmark=):
 - If **label=** strings **differ** between examples (e.g. one says "New Balance", another "Statement Balance as of …"), a regex that only matches **one** of those phrases is **wrong**. You must use **alternation** of the distinct label/landmark phrases (or a shared parent landmark) so that the **value** from **each** example would be captured. Escaping: quote minimal distinctive substrings; use IGNORECASE if casing varies.
+- If **landmark=** differs between examples (e.g. "Summary of Account Activity" vs "Payment Information"), the layouts are different: consider alternation that includes **both** landmark+label+value paths, or a regex whose anchors reflect each pair — do not silently drop a landmark from a non-primary example.
 - In rationale or confidence_notes, briefly state that the pattern covers each listed source/example (or explain which layout is out of scope).
 """
 
@@ -140,8 +141,9 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
             + (
                 (
                     "\n   Multiple OCR examples below may come from different PDFs. "
-                    "If the label= (or landmark+) strings are NOT the same across examples, "
-                    "use alternation so EACH example's value shape is reachable — do not anchor only on the entity display name or on the first example's label."
+                    "If the label= (or landmark=) strings are NOT the same across examples, "
+                    "use alternation so EACH example's value shape is reachable — do not anchor only on the entity display name, "
+                    "only the first example's label, or only the first example's landmark."
                 )
                 if multi
                 else ""

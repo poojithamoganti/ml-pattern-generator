@@ -339,6 +339,14 @@
   resize: vertical;
 }
 
+.hints-sync-note {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
 .entity-annotate-block {
   grid-column: 1 / -1;
   display: flex;
