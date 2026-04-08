@@ -143,6 +143,67 @@
   border: 1px solid var(--border);
 }
 
+.annotate {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+}
+
+.annotate-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.annotate-page {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.pick-hint {
+  font-size: 0.85rem;
+  color: var(--text-h);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  padding: 0.25rem 0.6rem;
+}
+
+.ocr-canvas {
+  position: relative;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+}
+
+.ocr-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.ocr-box {
+  position: absolute;
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.10);
+  cursor: pointer;
+}
+
+.ocr-box:disabled {
+  cursor: not-allowed;
+  opacity: 0.25;
+}
+
+.ocr-box:not(:disabled):hover {
+  background: rgba(59, 130, 246, 0.22);
+  border-color: rgba(59, 130, 246, 0.8);
+}
+
 .entity-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(140px, 180px) auto;
@@ -178,6 +239,27 @@
   margin-top: 0.35rem;
   min-height: 3rem;
   resize: vertical;
+}
+
+.pick-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto auto auto 1fr;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.25rem;
+}
+
+.pick-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.pick-summary code {
+  font-size: 0.78rem;
 }
 
 @media (max-width: 600px) {

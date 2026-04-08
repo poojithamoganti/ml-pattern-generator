@@ -58,6 +58,7 @@ class RegexBatchResponse(BaseModel):
 
 
 class UploadResponse(BaseModel):
+    upload_id: str = Field(..., description="Server-side id for the uploaded PDF (prefix of stored filename)")
     filename: str
     pages: int
     text_preview: str
@@ -66,3 +67,26 @@ class UploadResponse(BaseModel):
     extraction_mode: str = ""
     ocr_engine: str = ""
     ocr_dpi: int = 300
+
+
+class OcrBox(BaseModel):
+    id: str
+    text: str
+    page: int
+    # Pixel coordinates in the rendered page image (same DPI as requested)
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    conf: float = 1.0
+
+
+class OcrBoxesResponse(BaseModel):
+    upload_id: str
+    page: int
+    dpi: int
+    width: int
+    height: int
+    # PNG bytes as base64 (data URL is built in frontend)
+    image_base64: str
+    boxes: list[OcrBox]

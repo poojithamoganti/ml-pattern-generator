@@ -28,10 +28,12 @@ from app.schemas import (
     RegexBatchResponse,
     RegexGenerateRequest,
     RegexGenerateResponse,
+    OcrBoxesResponse,
     UploadResponse,
 )
 from app.services.llm_regex import generate_regex_patterns
 from app.services.pdf_extract import extract_document, save_upload
+from app.services.ocr_boxes import ocr_boxes_for_upload
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -165,6 +167,7 @@ async def upload_pdf(
 
     preview = text[:4000] + ("..." if len(text) > 4000 else "")
     return UploadResponse(
+        upload_id=uid,
         filename=file.filename,
         pages=pages,
         text_preview=preview,
@@ -174,6 +177,29 @@ async def upload_pdf(
         ocr_engine=engine,
         ocr_dpi=dpi,
     )
+
+
+@app.get("/api/ocr-boxes", response_model=OcrBoxesResponse)
+async def get_ocr_boxes(
+    upload_id: str,
+    page: int = 1,
+    dpi: int = 200,
+):
+    """
+    Return a rendered page image + OCR token boxes (EasyOCR) for annotation UI.
+    Page is 1-indexed.
+    """
+    if page < 1:
+        raise HTTPException(400, "page must be >= 1")
+    if dpi < 72 or dpi > 600:
+        raise HTTPException(400, "dpi must be between 72 and 600.")
+    try:
+        return await ocr_boxes_for_upload(upload_id=upload_id, page=page, dpi=dpi)
+    except FileNotFoundError:
+        raise HTTPException(404, "Upload not found. Upload the PDF again.") from None
+    except Exception as e:
+        logger.exception("OCR boxes failed")
+        raise HTTPException(500, f"OCR boxes failed: {e}") from e
 
 
 @app.post("/api/generate-regex-batch", response_model=RegexBatchResponse)

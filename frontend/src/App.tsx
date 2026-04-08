@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   generateRegex,
+  getOcrBoxes,
   listModels,
   ollamaHealth,
   uploadPdf,
   type EntitySpec,
+  type OcrBox,
+  type OcrBoxesResponse,
   type RegexGenerateResponse,
   type UploadResponse,
 } from './api'
@@ -31,6 +34,9 @@ type EntityForm = {
   name: string
   kind: string
   hints: string
+  picked_landmark?: { text: string; box_id: string; page: number }
+  picked_label?: { text: string; box_id: string; page: number }
+  picked_value?: { text: string; box_id: string; page: number }
 }
 
 function toSpecs(rows: EntityForm[]): EntitySpec[] {
@@ -77,6 +83,13 @@ export default function App() {
   const [extractionMode, setExtractionMode] = useState<'scan' | 'auto' | 'embedded'>('scan')
   const [ocrEngine, setOcrEngine] = useState<'paddle' | 'easyocr' | 'docling'>('easyocr')
   const [ocrDpi, setOcrDpi] = useState(300)
+  const [docMode, setDocMode] = useState<'text' | 'annotate'>('text')
+  const [ocrPage, setOcrPage] = useState(1)
+  const [ocrDpiAnnotate, setOcrDpiAnnotate] = useState(200)
+  const [ocrView, setOcrView] = useState<OcrBoxesResponse | null>(null)
+  const [activePick, setActivePick] = useState<{ entityId: string; field: 'landmark' | 'label' | 'value' } | null>(
+    null,
+  )
   const [busyHint, setBusyHint] = useState('')
   const [elapsedSec, setElapsedSec] = useState(0)
   const [ollamaWarn, setOllamaWarn] = useState<string | null>(null)
@@ -131,13 +144,65 @@ export default function App() {
         ocrDpi: ocrDpi,
       })
       setUpload(u)
+      setOcrView(null)
+      setActivePick(null)
+      if (docMode === 'annotate') {
+        setBusyHint('Preparing OCR boxes for annotation…')
+        const v = await getOcrBoxes({ upload_id: u.upload_id, page: 1, dpi: ocrDpiAnnotate })
+        setOcrPage(1)
+        setOcrView(v)
+      }
     } catch (er: unknown) {
       setErr(String(er))
     } finally {
       setBusy(false)
       setBusyHint('')
     }
-  }, [extractionMode, ocrEngine, ocrDpi])
+  }, [extractionMode, ocrEngine, ocrDpi, docMode, ocrDpiAnnotate])
+
+  const loadOcrPage = async (page: number) => {
+    if (!upload) return
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Loading OCR boxes…')
+    try {
+      const v = await getOcrBoxes({ upload_id: upload.upload_id, page, dpi: ocrDpiAnnotate })
+      setOcrPage(page)
+      setOcrView(v)
+    } catch (e: unknown) {
+      setErr(String(e))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
+  const onPickBox = (box: OcrBox) => {
+    if (!activePick) return
+    setEntities((prev) =>
+      prev.map((r) => {
+        if (r.id !== activePick.entityId) return r
+        if (activePick.field === 'landmark') {
+          const nextHints = r.hints.includes('Landmark:')
+            ? r.hints
+            : `${r.hints}${r.hints.trim() ? '\n' : ''}Landmark: "${box.text}"`
+          return { ...r, picked_landmark: { text: box.text, box_id: box.id, page: box.page }, hints: nextHints }
+        }
+        if (activePick.field === 'label') {
+          const nextHints = r.hints.includes('"')
+            ? r.hints
+            : `${r.hints}${r.hints.trim() ? '\n' : ''}Label text: "${box.text}"`
+          return { ...r, picked_label: { text: box.text, box_id: box.id, page: box.page }, hints: nextHints }
+        }
+        const nextHints =
+          r.hints.trim().length === 0
+            ? `Example value: "${box.text}"`
+            : `${r.hints}\nExample value: "${box.text}"`
+        return { ...r, picked_value: { text: box.text, box_id: box.id, page: box.page }, hints: nextHints }
+      }),
+    )
+    setActivePick(null)
+  }
 
   const addEntity = () => {
     setEntities((prev) => [
@@ -242,6 +307,24 @@ export default function App() {
           <h2>1. Document</h2>
           <div className="extract-opts">
           <label>
+            Input
+            <select
+              value={docMode}
+              onChange={(e) => {
+                const v = e.target.value as typeof docMode
+                setDocMode(v)
+                setOcrView(null)
+                setActivePick(null)
+                if (v === 'annotate' && upload?.upload_id) {
+                  loadOcrPage(1)
+                }
+              }}
+            >
+              <option value="text">Extract text</option>
+              <option value="annotate">Annotate OCR boxes (MVP)</option>
+            </select>
+          </label>
+          <label>
             Mode
             <select
               value={extractionMode}
@@ -264,6 +347,21 @@ export default function App() {
               <option value="docling">Docling (layout + OCR — install backend extra)</option>
             </select>
           </label>
+          {docMode === 'annotate' && (
+            <label>
+              Boxes DPI
+              <input
+                type="number"
+                min={100}
+                max={400}
+                step={50}
+                value={ocrDpiAnnotate}
+                onChange={(e) => setOcrDpiAnnotate(Number(e.target.value) || 200)}
+                disabled={busy}
+                title="Lower DPI loads faster; affects box coordinates for annotation only."
+              />
+            </label>
+          )}
           <label>
             Render DPI
             <input
@@ -318,6 +416,68 @@ export default function App() {
             <pre className="preview-body">{upload.full_text}</pre>
           </details>
         )}
+
+        {docMode === 'annotate' && upload && (
+          <div className="annotate">
+            <div className="annotate-toolbar">
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => loadOcrPage(Math.max(1, ocrPage - 1))}
+                disabled={busy || ocrPage <= 1}
+              >
+                Prev page
+              </button>
+              <div className="annotate-page">
+                Page {ocrPage} / {upload.pages}
+              </div>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => loadOcrPage(Math.min(upload.pages, ocrPage + 1))}
+                disabled={busy || ocrPage >= upload.pages}
+              >
+                Next page
+              </button>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => loadOcrPage(ocrPage)}
+                disabled={busy}
+              >
+                Refresh boxes
+              </button>
+              {activePick && <div className="pick-hint">Click a box to set {activePick.field}…</div>}
+            </div>
+
+            {ocrView && (
+              <div className="ocr-canvas" style={{ aspectRatio: `${ocrView.width} / ${ocrView.height}` }}>
+                <img
+                  className="ocr-image"
+                  src={`data:image/png;base64,${ocrView.image_base64}`}
+                  alt={`OCR page ${ocrView.page}`}
+                />
+                {ocrView.boxes.map((b) => {
+                  const left = (b.x0 / ocrView.width) * 100
+                  const top = (b.y0 / ocrView.height) * 100
+                  const w = ((b.x1 - b.x0) / ocrView.width) * 100
+                  const h = ((b.y1 - b.y0) / ocrView.height) * 100
+                  return (
+                    <button
+                      key={b.id}
+                      type="button"
+                      className="ocr-box"
+                      style={{ left: `${left}%`, top: `${top}%`, width: `${w}%`, height: `${h}%` }}
+                      title={b.text}
+                      onClick={() => onPickBox(b)}
+                      disabled={!activePick}
+                    />
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
         <section className="card">
@@ -347,6 +507,57 @@ export default function App() {
               <button type="button" className="btn ghost" onClick={() => removeEntity(row.id)} title="Remove">
                 ✕
               </button>
+              {docMode === 'annotate' && (
+                <div className="pick-row">
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() => setActivePick({ entityId: row.id, field: 'landmark' })}
+                    disabled={!ocrView || busy}
+                  >
+                    Pick landmark
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() => setActivePick({ entityId: row.id, field: 'label' })}
+                    disabled={!ocrView || busy}
+                  >
+                    Pick label
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() => setActivePick({ entityId: row.id, field: 'value' })}
+                    disabled={!ocrView || busy}
+                  >
+                    Pick value
+                  </button>
+                  <div className="pick-summary">
+                    {row.picked_landmark?.text ? (
+                      <span>
+                        Landmark: <code>{row.picked_landmark.text}</code>
+                      </span>
+                    ) : (
+                      <span>Landmark: —</span>
+                    )}
+                    {row.picked_label?.text ? (
+                      <span>
+                        Label: <code>{row.picked_label.text}</code>
+                      </span>
+                    ) : (
+                      <span>Label: —</span>
+                    )}
+                    {row.picked_value?.text ? (
+                      <span>
+                        Value: <code>{row.picked_value.text}</code>
+                      </span>
+                    ) : (
+                      <span>Value: —</span>
+                    )}
+                  </div>
+                </div>
+              )}
               <label className="entity-hints-label">
                 Hints (position, column, layout, format)
                 <textarea

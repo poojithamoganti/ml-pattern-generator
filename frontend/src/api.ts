@@ -59,6 +59,7 @@ export type EntitySpec = {
 }
 
 export type UploadResponse = {
+  upload_id: string
   filename: string
   pages: number
   text_preview: string
@@ -67,6 +68,39 @@ export type UploadResponse = {
   extraction_mode?: string
   ocr_engine?: string
   ocr_dpi?: number
+}
+
+export type OcrBox = {
+  id: string
+  text: string
+  page: number
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+  conf: number
+}
+
+export type OcrBoxesResponse = {
+  upload_id: string
+  page: number
+  dpi: number
+  width: number
+  height: number
+  image_base64: string
+  boxes: OcrBox[]
+}
+
+export async function getOcrBoxes(params: {
+  upload_id: string
+  page?: number
+  dpi?: number
+}): Promise<OcrBoxesResponse> {
+  const q = new URLSearchParams()
+  q.set('upload_id', params.upload_id)
+  q.set('page', String(params.page ?? 1))
+  q.set('dpi', String(params.dpi ?? 200))
+  return fetchJson(`${BASE}/api/ocr-boxes?${q.toString()}`, { method: 'GET', headers: {} })
 }
 
 export async function uploadPdf(
