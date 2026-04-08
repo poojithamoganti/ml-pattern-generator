@@ -507,15 +507,21 @@ def _parse_patterns_from_raw(raw: str, entities: list[EntitySpec]) -> list[Regex
 
 REFINEMENT_SYSTEM_PROMPT = """You are a regex repair assistant for Python 3 `re` (not PCRE).
 
-You receive first-pass patterns, primary OCR text, and real `re.findall` results plus any compile errors.
+You receive first-pass patterns, primary OCR text, real `re.findall` results, compile errors, and each entity's kind/hints.
 
 Output: one JSON object with key "patterns" (array). Each item: entity (exact name from the user list), pattern, flags, rationale, confidence_notes.
 
 Rules:
 - Patterns must compile with Python `re`. Forbidden: \\\\K, (?R). Pattern values are JSON strings with doubled backslashes.
-- If findall already returns sensible captures, you may keep patterns unchanged or tighten only if clearly over-broad.
-- If findall is empty or regex errored, propose fixes that plausibly extract the intended values from this OCR text (anchor near labels/landmarks; avoid matching random dates/amounts globally).
-- Briefly note what you changed in rationale or confidence_notes.
+
+**Portable patterns (do not overfit this page):**
+- Do **not** build alternations of **specific values** seen in the OCR: person names, surnames, partial account numbers, or one-off words — unless they are stable **field labels** that repeat on every similar statement (e.g. "New Balance", "Statement Closing Date"). Wrong: `(?:Carol|Smith|Tolbert|...)`. Right: anchor on the label phrase (from hints or visible text) and capture the **value** with a generic shape (e.g. name-like `[\w'.-]+(?:\s+[\w'.-]+)+`, date `\\\\d{1,2}/\\\\d{1,2}/\\\\d{4}`, money with separators).
+- If `findall` already returns sensible captures, **keep** the pattern or change the **minimum** needed. Do not add extra literals "to be safe."
+- If `findall` is empty or errors: fix using **label/landmark** text in the OCR plus value shape classes — never "patch" by enumerating example values from the document.
+
+**OCR noise:** Near currency/amount labels, `$` is often misread as `s` or `S`. After a clear amount label anchor, allow an optional currency glitch before digits, e.g. `(?:[$\\\\s]|(?<![A-Za-z])[sS])(?=\d)` or a tight `[$sS]?` **only** in the amount position after the label — avoid bare `s` that match unrelated text.
+
+**Anchoring:** Prefer label phrases + value shape over global date/amount scans. Briefly note substantive edits in rationale or confidence_notes.
 """
 
 
@@ -523,6 +529,9 @@ REFINEMENT_USER_TEMPLATE = """Primary document OCR (truncated; this is the same 
 ---
 {ocr}
 ---
+
+Extraction targets (kind + hints — stay aligned with first pass; use kind to choose value shape, not to memorize OCR tokens):
+{entity_context}
 
 First-pass patterns (JSON):
 {first_patterns_json}
@@ -538,6 +547,20 @@ Entity names (output patterns[].entity must match exactly):
 {names_list}
 
 Return JSON only: an object with a "patterns" array (same shape as above)."""
+
+
+def _build_refinement_entity_context(entities: list[EntitySpec]) -> str:
+    """Compact per-entity lines so the refinement model sees kind/hints without the full generator block."""
+    lines: list[str] = []
+    for e in entities:
+        k = (e.kind or "text").strip() or "text"
+        occ = (getattr(e, "occurrence", None) or "single").strip() or "single"
+        if occ not in ("single", "multiple"):
+            occ = "single"
+        hints = (e.hints or "").strip()
+        hpart = f"\n    hints: {hints}" if hints else ""
+        lines.append(f"- {e.name!r}: kind={k}, occurrence={occ}{hpart}")
+    return "\n".join(lines) if lines else "(none)"
 
 
 def evaluate_patterns_on_ocr(
@@ -590,8 +613,10 @@ async def refine_regex_patterns_with_llm(
     matches_json = json.dumps(matches, ensure_ascii=False, indent=2)
     errors_json = json.dumps(errors, ensure_ascii=False, indent=2)
     names_list = ", ".join(repr(e.name) for e in entities)
+    entity_context = _build_refinement_entity_context(entities)
     user_content = REFINEMENT_USER_TEMPLATE.format(
         ocr=ocr,
+        entity_context=entity_context,
         first_patterns_json=first_json,
         matches_json=matches_json,
         errors_json=errors_json,
