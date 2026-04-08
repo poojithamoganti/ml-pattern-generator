@@ -111,10 +111,13 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
         for j, ex in enumerate(getattr(e, "examples", []) or [], 1):
             if not isinstance(ex, dict):
                 continue
+            source = str(ex.get("source", "") or "").strip()
             landmark = str(ex.get("landmark", "") or "").strip()
             label = str(ex.get("label", "") or "").strip()
             value = str(ex.get("value", "") or "").strip()
             parts: list[str] = []
+            if source:
+                parts.append(f'source="{source}"')
             if landmark:
                 parts.append(f'landmark="{landmark}"')
             if label:
@@ -123,11 +126,17 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
                 parts.append(f'value="{value}"')
             if parts:
                 ex_lines.append(f"   example {j}: " + " ; ".join(parts))
+        multi = len(ex_lines) > 1
         lines.append(
             f"{i}. name: {e.name}\n"
             f"   expected type: {kind}\n"
             f"   occurrence: {occ}\n"
             f"   layout / position hints: {hints}"
+            + (
+                ("\n   Multiple OCR examples below may come from different PDFs; synthesize ONE pattern that fits all.")
+                if multi
+                else ""
+            )
             + (("\n" + "\n".join(ex_lines)) if ex_lines else "")
         )
     return "\n".join(lines)

@@ -61,6 +61,19 @@
   color: var(--text-h);
 }
 
+.section-lead {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin: -0.25rem 0 1rem;
+  max-width: 52rem;
+}
+
+.section-lead strong {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
 .hint {
   font-size: 0.875rem;
   color: var(--text-muted);
@@ -204,9 +217,36 @@
   margin-bottom: 0.75rem;
 }
 
+.annotate-doc-select {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.annotate-doc-select select {
+  min-width: 12rem;
+  max-width: min(28rem, 100%);
+}
+
 .annotate-page {
   font-size: 0.85rem;
   color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem;
+  max-width: 100%;
+}
+
+.annotate-doc-name {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pick-hint {
@@ -299,13 +339,76 @@
   resize: vertical;
 }
 
-.pick-row {
+.entity-annotate-block {
   grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.pick-row {
   display: grid;
   grid-template-columns: auto auto auto 1fr;
   gap: 0.5rem;
   align-items: center;
-  margin-top: 0.25rem;
+}
+
+.pick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.pick-doc {
+  flex-basis: 100%;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.pick-doc strong {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.saved-examples {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.78rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.saved-examples li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.saved-examples li:last-child {
+  border-bottom: none;
+}
+
+.saved-examples-source {
+  font-weight: 600;
+  color: var(--text-h);
+  flex: 0 0 auto;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.saved-examples-bits {
+  flex: 1 1 12rem;
+  color: var(--text-muted);
+  line-height: 1.35;
+  word-break: break-word;
 }
 
 .pick-summary {

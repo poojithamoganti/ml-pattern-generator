@@ -31,6 +31,19 @@ const ENTITY_KINDS = [
   { value: 'other', label: 'Other' },
 ] as const
 
+/** Extra layout PDFs: text for generation + server id for bbox annotation */
+type ExtraSample = { id: string; filename: string; full_text: string; upload_id: string; pages: number }
+
+const ANNOTATE_PRIMARY = '__primary__'
+
+type SavedPickExample = {
+  /** Which PDF these picks were made on (shown in API as source) */
+  sourceLabel: string
+  landmark?: { text: string; box_id: string; page: number }
+  label?: { text: string; box_id: string; page: number }
+  value?: { text: string; box_id: string; page: number }
+}
+
 type EntityForm = {
   id: string
   name: string
@@ -40,27 +53,91 @@ type EntityForm = {
   picked_landmark?: { text: string; box_id: string; page: number }
   picked_label?: { text: string; box_id: string; page: number }
   picked_value?: { text: string; box_id: string; page: number }
-  examples?: Array<{
-    landmark?: { text: string; box_id: string; page: number }
-    label?: { text: string; box_id: string; page: number }
-    value?: { text: string; box_id: string; page: number }
-  }>
+  /** PDF label at time of last box pick (for draft + API source) */
+  pickSourceLabel?: string
+  /** Saved landmark/label/value groups — use one row per entity name; add multiple for different PDFs */
+  examples?: SavedPickExample[]
 }
 
+type ApiExample = { landmark?: string; label?: string; value?: string; source?: string }
+
+function exampleKey(e: ApiExample): string {
+  return [e.source || '', e.landmark || '', e.label || '', e.value || ''].join('\x01')
+}
+
+function docLabelForAnnotate(
+  annotateDocId: string,
+  upload: UploadResponse | null,
+  extraSamples: ExtraSample[],
+): string {
+  if (!upload) return 'document'
+  if (annotateDocId === ANNOTATE_PRIMARY) return `Primary — ${upload.filename}`
+  const s = extraSamples.find((x) => x.id === annotateDocId)
+  return s ? `Sample — ${s.filename}` : `Primary — ${upload.filename}`
+}
+
+function picksToApiDraft(row: EntityForm): ApiExample | null {
+  if (!row.picked_landmark && !row.picked_label && !row.picked_value) return null
+  return {
+    landmark: row.picked_landmark?.text,
+    label: row.picked_label?.text,
+    value: row.picked_value?.text,
+    source: row.pickSourceLabel,
+  }
+}
+
+/** Merge rows with the same entity name; combine saved examples + current picks into one EntitySpec. */
 function toSpecs(rows: EntityForm[]): EntitySpec[] {
-  return rows
-    .filter((r) => r.name.trim())
-    .map((r) => ({
-      name: r.name.trim(),
-      kind: r.kind || 'text',
-      occurrence: r.occurrence || 'single',
-      hints: r.hints.trim(),
-      examples: (r.examples || []).map((ex) => ({
-        landmark: ex.landmark?.text,
-        label: ex.label?.text,
-        value: ex.value?.text,
-      })),
-    }))
+  const named = rows.filter((r) => r.name.trim())
+  const groups = new Map<string, EntityForm[]>()
+  for (const r of named) {
+    const k = r.name.trim().toLowerCase()
+    if (!groups.has(k)) groups.set(k, [])
+    groups.get(k)!.push(r)
+  }
+  const out: EntitySpec[] = []
+  for (const [, group] of groups) {
+    const head = group[0]
+    const merged: ApiExample[] = []
+    const seen = new Set<string>()
+    const pushEx = (e: ApiExample) => {
+      if (!(e.landmark || e.label || e.value)) return
+      const k = exampleKey(e)
+      if (seen.has(k)) return
+      seen.add(k)
+      merged.push(e)
+    }
+    const hintParts: string[] = []
+    for (const r of group) {
+      for (const ex of r.examples || []) {
+        pushEx({
+          landmark: ex.landmark?.text,
+          label: ex.label?.text,
+          value: ex.value?.text,
+          source: ex.sourceLabel,
+        })
+      }
+      const draft = picksToApiDraft(r)
+      if (draft) pushEx(draft)
+      if (r.hints.trim()) hintParts.push(r.hints.trim())
+    }
+    const examples: Record<string, string>[] = merged.map((e) => {
+      const o: Record<string, string> = {}
+      if (e.landmark != null && e.landmark !== '') o.landmark = e.landmark
+      if (e.label != null && e.label !== '') o.label = e.label
+      if (e.value != null && e.value !== '') o.value = e.value
+      if (e.source != null && e.source !== '') o.source = e.source
+      return o
+    })
+    out.push({
+      name: head.name.trim(),
+      kind: head.kind || 'text',
+      occurrence: head.occurrence || 'single',
+      hints: hintParts.join('\n\n---\n'),
+      examples,
+    })
+  }
+  return out
 }
 
 /** Pretty-print if the model returned JSON; otherwise show verbatim. */
@@ -90,10 +167,28 @@ function normalizeForMatch(s: string): string {
     .trim()
 }
 
+function resolveAnnotateCtx(
+  u: UploadResponse | null,
+  extras: ExtraSample[],
+  docId: string,
+): { upload_id: string; pages: number; filename: string } | null {
+  if (!u) return null
+  if (docId === ANNOTATE_PRIMARY) {
+    return { upload_id: u.upload_id, pages: u.pages, filename: u.filename }
+  }
+  const ex = extras.find((s) => s.id === docId)
+  if (!ex) {
+    return { upload_id: u.upload_id, pages: u.pages, filename: u.filename }
+  }
+  return { upload_id: ex.upload_id, pages: ex.pages, filename: ex.filename }
+}
+
 export default function App() {
   const [upload, setUpload] = useState<UploadResponse | null>(null)
-  /** Extra PDFs (text only) sent with generate for cross-document pattern synthesis */
-  const [extraSamples, setExtraSamples] = useState<Array<{ id: string; filename: string; full_text: string }>>([])
+  /** Extra PDFs sent with generate; each keeps upload_id for optional bbox annotation */
+  const [extraSamples, setExtraSamples] = useState<ExtraSample[]>([])
+  /** Which uploaded PDF to show in Annotate mode: primary or one extra sample id */
+  const [annotateDocId, setAnnotateDocId] = useState<string>(ANNOTATE_PRIMARY)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [entities, setEntities] = useState<EntityForm[]>([
@@ -124,6 +219,39 @@ export default function App() {
   const [busyHint, setBusyHint] = useState('')
   const [elapsedSec, setElapsedSec] = useState(0)
   const [ollamaWarn, setOllamaWarn] = useState<string | null>(null)
+
+  const loadOcrPage = useCallback(
+    async (page: number, docIdOverride?: string, dpiOverride?: number) => {
+      const docId = docIdOverride ?? annotateDocId
+      const ctx = resolveAnnotateCtx(upload, extraSamples, docId)
+      if (!ctx) return
+      const dpi = dpiOverride ?? ocrDpiAnnotate
+      setErr(null)
+      setBusy(true)
+      setBusyHint('Loading OCR boxes…')
+      try {
+        const v = await getOcrBoxes({ upload_id: ctx.upload_id, page, dpi })
+        setOcrPage(page)
+        setOcrView(v)
+      } catch (e: unknown) {
+        setErr(String(e))
+      } finally {
+        setBusy(false)
+        setBusyHint('')
+      }
+    },
+    [upload, extraSamples, annotateDocId, ocrDpiAnnotate],
+  )
+
+  useEffect(() => {
+    if (annotateDocId === ANNOTATE_PRIMARY) return
+    if (!extraSamples.some((s) => s.id === annotateDocId)) {
+      setAnnotateDocId(ANNOTATE_PRIMARY)
+      if (docMode === 'annotate' && upload) {
+        void loadOcrPage(1, ANNOTATE_PRIMARY)
+      }
+    }
+  }, [extraSamples, annotateDocId, docMode, upload, loadOcrPage])
 
   useEffect(() => {
     if (!busy) {
@@ -175,6 +303,7 @@ export default function App() {
         ocrDpi: ocrDpi,
       })
       setUpload(u)
+      setAnnotateDocId(ANNOTATE_PRIMARY)
       setOcrView(null)
       setActivePick(null)
       if (docMode === 'annotate') {
@@ -211,7 +340,13 @@ export default function App() {
         })
         setExtraSamples((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), filename: u.filename, full_text: u.full_text },
+          {
+            id: crypto.randomUUID(),
+            filename: u.filename,
+            full_text: u.full_text,
+            upload_id: u.upload_id,
+            pages: u.pages,
+          },
         ])
       } catch (er: unknown) {
         setErr(String(er))
@@ -224,9 +359,18 @@ export default function App() {
     [extraSamples.length, extractionMode, ocrEngine, ocrDpi],
   )
 
-  const removeExtraSample = useCallback((id: string) => {
-    setExtraSamples((prev) => prev.filter((s) => s.id !== id))
-  }, [])
+  const removeExtraSample = useCallback(
+    (id: string) => {
+      setExtraSamples((prev) => prev.filter((s) => s.id !== id))
+      if (id === annotateDocId) {
+        setAnnotateDocId(ANNOTATE_PRIMARY)
+        if (docMode === 'annotate' && upload) {
+          void loadOcrPage(1, ANNOTATE_PRIMARY)
+        }
+      }
+    },
+    [annotateDocId, docMode, upload, loadOcrPage],
+  )
 
   const onValidationFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
@@ -320,25 +464,9 @@ export default function App() {
     setHighlightBoxIds(want)
   }, [validation, validationOcrView, showValidationHighlights])
 
-  const loadOcrPage = async (page: number) => {
-    if (!upload) return
-    setErr(null)
-    setBusy(true)
-    setBusyHint('Loading OCR boxes…')
-    try {
-      const v = await getOcrBoxes({ upload_id: upload.upload_id, page, dpi: ocrDpiAnnotate })
-      setOcrPage(page)
-      setOcrView(v)
-    } catch (e: unknown) {
-      setErr(String(e))
-    } finally {
-      setBusy(false)
-      setBusyHint('')
-    }
-  }
-
   const onPickBox = (box: OcrBox) => {
     if (!activePick) return
+    const pickSrc = docLabelForAnnotate(annotateDocId, upload, extraSamples)
     setEntities((prev) =>
       prev.map((r) => {
         if (r.id !== activePick.entityId) return r
@@ -346,28 +474,78 @@ export default function App() {
           const nextHints = r.hints.includes('Landmark:')
             ? r.hints
             : `${r.hints}${r.hints.trim() ? '\n' : ''}Landmark: "${box.text}"`
-          return { ...r, picked_landmark: { text: box.text, box_id: box.id, page: box.page }, hints: nextHints }
+          return {
+            ...r,
+            picked_landmark: { text: box.text, box_id: box.id, page: box.page },
+            hints: nextHints,
+            pickSourceLabel: pickSrc,
+          }
         }
         if (activePick.field === 'label') {
           const nextHints = r.hints.includes('"')
             ? r.hints
             : `${r.hints}${r.hints.trim() ? '\n' : ''}Label text: "${box.text}"`
-          return { ...r, picked_label: { text: box.text, box_id: box.id, page: box.page }, hints: nextHints }
+          return {
+            ...r,
+            picked_label: { text: box.text, box_id: box.id, page: box.page },
+            hints: nextHints,
+            pickSourceLabel: pickSrc,
+          }
         }
         const nextHints =
           r.hints.trim().length === 0
             ? `Example value: "${box.text}"`
             : `${r.hints}\nExample value: "${box.text}"`
-        return { ...r, picked_value: { text: box.text, box_id: box.id, page: box.page }, hints: nextHints }
+        return {
+          ...r,
+          picked_value: { text: box.text, box_id: box.id, page: box.page },
+          hints: nextHints,
+          pickSourceLabel: pickSrc,
+        }
       }),
     )
     setActivePick(null)
   }
 
+  const savePicksAsExample = (entityId: string) => {
+    setEntities((prev) =>
+      prev.map((r) => {
+        if (r.id !== entityId) return r
+        if (!r.picked_landmark && !r.picked_label && !r.picked_value) return r
+        const sourceLabel = r.pickSourceLabel ?? docLabelForAnnotate(annotateDocId, upload, extraSamples)
+        const nextEx: SavedPickExample = {
+          sourceLabel,
+          landmark: r.picked_landmark,
+          label: r.picked_label,
+          value: r.picked_value,
+        }
+        return {
+          ...r,
+          examples: [...(r.examples || []), nextEx],
+          picked_landmark: undefined,
+          picked_label: undefined,
+          picked_value: undefined,
+          pickSourceLabel: undefined,
+        }
+      }),
+    )
+  }
+
+  const removeSavedExample = (entityId: string, index: number) => {
+    setEntities((prev) =>
+      prev.map((r) => {
+        if (r.id !== entityId) return r
+        const next = [...(r.examples || [])]
+        next.splice(index, 1)
+        return { ...r, examples: next }
+      }),
+    )
+  }
+
   const addEntity = () => {
     setEntities((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), name: '', kind: 'text', occurrence: 'single', hints: '' },
+      { id: crypto.randomUUID(), name: '', kind: 'text', occurrence: 'single', hints: '', examples: [] },
     ])
   }
 
@@ -450,6 +628,8 @@ export default function App() {
     URL.revokeObjectURL(a.href)
   }
 
+  const annotateCtx = upload ? resolveAnnotateCtx(upload, extraSamples, annotateDocId) : null
+
   return (
     <div className="app-shell">
       <header className="app-topbar">
@@ -519,7 +699,11 @@ export default function App() {
                 max={400}
                 step={50}
                 value={ocrDpiAnnotate}
-                onChange={(e) => setOcrDpiAnnotate(Number(e.target.value) || 200)}
+                onChange={(e) => {
+                  const n = Number(e.target.value) || 200
+                  setOcrDpiAnnotate(n)
+                  if (upload) void loadOcrPage(ocrPage, undefined, n)
+                }}
                 disabled={busy}
                 title="Lower DPI loads faster; affects box coordinates for annotation only."
               />
@@ -591,7 +775,13 @@ export default function App() {
                 <button
                   type="button"
                   className="btn secondary"
-                  onClick={() => setExtraSamples([])}
+                  onClick={() => {
+                    setExtraSamples([])
+                    if (annotateDocId !== ANNOTATE_PRIMARY) {
+                      setAnnotateDocId(ANNOTATE_PRIMARY)
+                      if (docMode === 'annotate' && upload) void loadOcrPage(1, ANNOTATE_PRIMARY)
+                    }
+                  }}
                   disabled={busy}
                 >
                   Clear extra samples
@@ -599,8 +789,8 @@ export default function App() {
               )}
             </div>
             <p className="muted small">
-              Extra PDFs are only used as additional OCR text for &quot;Generate patterns&quot; — same entities, different
-              layouts (e.g. alternate New Balance lines).
+              Extra PDFs add OCR text for generation and appear below in Annotate so you can pick landmark / label / value
+              boxes on each layout.
             </p>
           </div>
         )}
@@ -629,9 +819,29 @@ export default function App() {
           </details>
         )}
 
-        {docMode === 'annotate' && upload && (
+        {docMode === 'annotate' && upload && annotateCtx && (
           <div className="annotate">
             <div className="annotate-toolbar">
+              <label className="annotate-doc-select">
+                Annotate document
+                <select
+                  value={annotateDocId}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    setAnnotateDocId(v)
+                    void loadOcrPage(1, v)
+                  }}
+                  disabled={busy}
+                  aria-label="Choose which PDF to annotate with bounding boxes"
+                >
+                  <option value={ANNOTATE_PRIMARY}>Primary — {upload.filename}</option>
+                  {extraSamples.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      Sample — {s.filename}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button
                 type="button"
                 className="btn secondary"
@@ -641,13 +851,16 @@ export default function App() {
                 Prev page
               </button>
               <div className="annotate-page">
-                Page {ocrPage} / {upload.pages}
+                Page {ocrPage} / {annotateCtx.pages}
+                <span className="annotate-doc-name" title={annotateCtx.filename}>
+                  ({annotateCtx.filename})
+                </span>
               </div>
               <button
                 type="button"
                 className="btn secondary"
-                onClick={() => loadOcrPage(Math.min(upload.pages, ocrPage + 1))}
-                disabled={busy || ocrPage >= upload.pages}
+                onClick={() => loadOcrPage(Math.min(annotateCtx.pages, ocrPage + 1))}
+                disabled={busy || ocrPage >= annotateCtx.pages}
               >
                 Next page
               </button>
@@ -694,6 +907,13 @@ export default function App() {
 
         <section className="card">
           <h2>2. Entities</h2>
+          <p className="section-lead">
+            One row per logical field (e.g. <strong>New Balance</strong>). In <strong>Annotate</strong>, pick landmark /
+            label / value on the <strong>primary</strong> PDF, click <strong>Save picks as example</strong>, switch{' '}
+            <strong>Annotate document</strong> to a sample PDF, pick again for the <em>same</em> entity row, save again
+            — or add a second row with the same name; all examples merge into <strong>one</strong> pattern at generate
+            time.
+          </p>
           {entities.map((row) => (
             <div key={row.id} className="entity-row">
               <input
@@ -733,54 +953,95 @@ export default function App() {
                 ✕
               </button>
               {docMode === 'annotate' && (
-                <div className="pick-row">
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    onClick={() => setActivePick({ entityId: row.id, field: 'landmark' })}
-                    disabled={!ocrView || busy}
-                  >
-                    Pick landmark
-                  </button>
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    onClick={() => setActivePick({ entityId: row.id, field: 'label' })}
-                    disabled={!ocrView || busy}
-                  >
-                    Pick label
-                  </button>
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    onClick={() => setActivePick({ entityId: row.id, field: 'value' })}
-                    disabled={!ocrView || busy}
-                  >
-                    Pick value
-                  </button>
-                  <div className="pick-summary">
-                    {row.picked_landmark?.text ? (
-                      <span>
-                        Landmark: <code>{row.picked_landmark.text}</code>
-                      </span>
-                    ) : (
-                      <span>Landmark: —</span>
-                    )}
-                    {row.picked_label?.text ? (
-                      <span>
-                        Label: <code>{row.picked_label.text}</code>
-                      </span>
-                    ) : (
-                      <span>Label: —</span>
-                    )}
-                    {row.picked_value?.text ? (
-                      <span>
-                        Value: <code>{row.picked_value.text}</code>
-                      </span>
-                    ) : (
-                      <span>Value: —</span>
-                    )}
+                <div className="entity-annotate-block">
+                  <div className="pick-row">
+                    <button
+                      type="button"
+                      className="btn secondary"
+                      onClick={() => setActivePick({ entityId: row.id, field: 'landmark' })}
+                      disabled={!ocrView || busy}
+                    >
+                      Pick landmark
+                    </button>
+                    <button
+                      type="button"
+                      className="btn secondary"
+                      onClick={() => setActivePick({ entityId: row.id, field: 'label' })}
+                      disabled={!ocrView || busy}
+                    >
+                      Pick label
+                    </button>
+                    <button
+                      type="button"
+                      className="btn secondary"
+                      onClick={() => setActivePick({ entityId: row.id, field: 'value' })}
+                      disabled={!ocrView || busy}
+                    >
+                      Pick value
+                    </button>
+                    <div className="pick-summary">
+                      {row.pickSourceLabel && (
+                        <span className="pick-doc">
+                          From: <strong>{row.pickSourceLabel}</strong>
+                        </span>
+                      )}
+                      {row.picked_landmark?.text ? (
+                        <span>
+                          Landmark: <code>{row.picked_landmark.text}</code>
+                        </span>
+                      ) : (
+                        <span>Landmark: —</span>
+                      )}
+                      {row.picked_label?.text ? (
+                        <span>
+                          Label: <code>{row.picked_label.text}</code>
+                        </span>
+                      ) : (
+                        <span>Label: —</span>
+                      )}
+                      {row.picked_value?.text ? (
+                        <span>
+                          Value: <code>{row.picked_value.text}</code>
+                        </span>
+                      ) : (
+                        <span>Value: —</span>
+                      )}
+                    </div>
                   </div>
+                  <div className="pick-actions">
+                    <button
+                      type="button"
+                      className="btn secondary"
+                      onClick={() => savePicksAsExample(row.id)}
+                      disabled={busy || (!row.picked_landmark && !row.picked_label && !row.picked_value)}
+                      title="Store current picks as one training example; then switch PDF and pick again, or generate."
+                    >
+                      Save picks as example
+                    </button>
+                  </div>
+                  {(row.examples?.length ?? 0) > 0 && (
+                    <ul className="saved-examples">
+                      {row.examples!.map((ex, i) => (
+                        <li key={`${row.id}-ex-${i}`}>
+                          <span className="saved-examples-source">{ex.sourceLabel}</span>
+                          <span className="saved-examples-bits">
+                            {[ex.landmark?.text && `lm: ${ex.landmark.text}`, ex.label?.text && `lb: ${ex.label.text}`, ex.value?.text && `val: ${ex.value.text}`]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                          <button
+                            type="button"
+                            className="btn ghost small"
+                            onClick={() => removeSavedExample(row.id, i)}
+                            disabled={busy}
+                            aria-label="Remove saved example"
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               )}
               <label className="entity-hints-label">

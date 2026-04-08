@@ -57,7 +57,8 @@ export type EntitySpec = {
   kind: string
   occurrence?: 'single' | 'multiple'
   hints: string
-  examples?: Array<{ landmark?: string; label?: string; value?: string }>
+  /** Multiple rows per entity (e.g. one PDF each); optional source labels which PDF */
+  examples?: Array<{ landmark?: string; label?: string; value?: string; source?: string }>
 }
 
 export type UploadResponse = {

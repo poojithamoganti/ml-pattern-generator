@@ -17,7 +17,7 @@ class EntitySpec(BaseModel):
     )
     examples: list[dict[str, str]] = Field(
         default_factory=list,
-        description="Optional examples for this entity. Each item may include keys: landmark, label, value.",
+        description="Optional examples for this entity. Keys: landmark, label, value; optional source (which PDF the row came from).",
     )
 
 
