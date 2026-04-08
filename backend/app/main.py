@@ -29,6 +29,8 @@ from app.schemas import (
     RegexGenerateRequest,
     RegexGenerateResponse,
     OcrBoxesResponse,
+    RegexValidateRequest,
+    RegexValidateResponse,
     UploadResponse,
 )
 from app.services.llm_regex import generate_regex_patterns
@@ -270,3 +272,33 @@ async def test_regex(body: RegexGenerateRequest):
             results[p.entity] = [f"<regex error: {e}>"]
 
     return {"generation": gen.model_dump(), "matches": results}
+
+
+@app.post("/api/validate-regex", response_model=RegexValidateResponse)
+async def validate_regex(body: RegexValidateRequest):
+    """Run provided patterns against provided text and return matches/errors per entity."""
+    results: dict[str, list[str]] = {}
+    errors: dict[str, str] = {}
+    flags_map = {
+        "IGNORECASE": re.IGNORECASE,
+        "DOTALL": re.DOTALL,
+        "MULTILINE": re.MULTILINE,
+    }
+    for p in body.patterns:
+        if not p.pattern.strip():
+            results[p.entity] = []
+            continue
+        fl = 0
+        for part in re.split(r"[|,]", (p.flags or "")):
+            part = part.strip()
+            if part in flags_map:
+                fl |= flags_map[part]
+        try:
+            m = re.findall(p.pattern, body.full_text, fl)
+            if m and isinstance(m[0], tuple):
+                m = [x for t in m for x in t if x]
+            results[p.entity] = m[:50] if isinstance(m, list) else [str(m)][:50]
+        except re.error as e:
+            results[p.entity] = []
+            errors[p.entity] = str(e)
+    return RegexValidateResponse(matches=results, errors=errors)

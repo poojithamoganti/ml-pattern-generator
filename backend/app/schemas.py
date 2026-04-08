@@ -7,9 +7,17 @@ class EntitySpec(BaseModel):
         default="text",
         description="Expected value shape: text, date, amount, currency, number, email, phone, address, id, other",
     )
+    occurrence: str = Field(
+        default="single",
+        description='Whether the entity is expected to appear once or multiple times on a page: "single" | "multiple"',
+    )
     hints: str = Field(
         default="",
         description="Where it appears on the page, layout, column, or format — not required to paste exact text",
+    )
+    examples: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Optional examples for this entity. Each item may include keys: landmark, label, value.",
     )
 
 
@@ -90,3 +98,13 @@ class OcrBoxesResponse(BaseModel):
     # PNG bytes as base64 (data URL is built in frontend)
     image_base64: str
     boxes: list[OcrBox]
+
+
+class RegexValidateRequest(BaseModel):
+    full_text: str = Field(..., min_length=1)
+    patterns: list[RegexPatternItem] = Field(..., min_length=1)
+
+
+class RegexValidateResponse(BaseModel):
+    matches: dict[str, list[str]]
+    errors: dict[str, str] = Field(default_factory=dict)

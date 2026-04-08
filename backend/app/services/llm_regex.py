@@ -70,6 +70,10 @@ Rules:
 - Each "pattern" value is a normal JSON string only. NEVER prefix with r or r" — invalid JSON. Never write pattern": r"
 - In JSON, backslashes must be doubled so the parsed string is valid for re: \\\\b \\\\s \\\\d etc.
 - Example pattern value: "\\\\bTotal\\\\b" or "Account\\\\s*Number:\\\\s*(\\\\d{16})"
+
+Occurrence guidance:
+- If occurrence is "single": prefer a pattern that returns ONE match on a typical page (tight anchor + tight value shape).
+- If occurrence is "multiple": prefer a pattern that matches ALL intended occurrences (e.g. repeated rows), still anchored by a label/landmark or a header/row key. Avoid over-broad patterns that match unrelated values.
 """
 
 USER_TEMPLATE = """Document text (may be truncated):
@@ -93,10 +97,31 @@ def _build_entity_block(entities: list[EntitySpec]) -> str:
     for i, e in enumerate(entities, 1):
         hints = (e.hints or "").strip() or "(none)"
         kind = (e.kind or "text").strip() or "text"
+        occ = (getattr(e, "occurrence", None) or "single").strip().lower()
+        if occ not in ("single", "multiple"):
+            occ = "single"
+        ex_lines: list[str] = []
+        for j, ex in enumerate(getattr(e, "examples", []) or [], 1):
+            if not isinstance(ex, dict):
+                continue
+            landmark = str(ex.get("landmark", "") or "").strip()
+            label = str(ex.get("label", "") or "").strip()
+            value = str(ex.get("value", "") or "").strip()
+            parts: list[str] = []
+            if landmark:
+                parts.append(f'landmark="{landmark}"')
+            if label:
+                parts.append(f'label="{label}"')
+            if value:
+                parts.append(f'value="{value}"')
+            if parts:
+                ex_lines.append(f"   example {j}: " + " ; ".join(parts))
         lines.append(
             f"{i}. name: {e.name}\n"
             f"   expected type: {kind}\n"
+            f"   occurrence: {occ}\n"
             f"   layout / position hints: {hints}"
+            + (("\n" + "\n".join(ex_lines)) if ex_lines else "")
         )
     return "\n".join(lines)
 
@@ -178,6 +203,14 @@ def _anchor_words_for_entity(e: EntitySpec) -> set[str]:
     for m in re.finditer(r"['\"]([^'\"]{3,})['\"]", e.hints or ""):
         for w in re.findall(r"[A-Za-z]{3,}", m.group(1)):
             words.add(w.lower())
+    # Example landmark/label phrases
+    for ex in getattr(e, "examples", []) or []:
+        if not isinstance(ex, dict):
+            continue
+        for key in ("landmark", "label"):
+            val = str(ex.get(key, "") or "")
+            for w in re.findall(r"[A-Za-z]{3,}", val):
+                words.add(w.lower())
     return words
 
 

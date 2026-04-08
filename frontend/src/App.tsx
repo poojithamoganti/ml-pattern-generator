@@ -5,10 +5,12 @@ import {
   listModels,
   ollamaHealth,
   uploadPdf,
+  validateRegex,
   type EntitySpec,
   type OcrBox,
   type OcrBoxesResponse,
   type RegexGenerateResponse,
+  type RegexPatternItem,
   type UploadResponse,
 } from './api'
 import './App.css'
@@ -33,10 +35,16 @@ type EntityForm = {
   id: string
   name: string
   kind: string
+  occurrence: 'single' | 'multiple'
   hints: string
   picked_landmark?: { text: string; box_id: string; page: number }
   picked_label?: { text: string; box_id: string; page: number }
   picked_value?: { text: string; box_id: string; page: number }
+  examples?: Array<{
+    landmark?: { text: string; box_id: string; page: number }
+    label?: { text: string; box_id: string; page: number }
+    value?: { text: string; box_id: string; page: number }
+  }>
 }
 
 function toSpecs(rows: EntityForm[]): EntitySpec[] {
@@ -45,7 +53,13 @@ function toSpecs(rows: EntityForm[]): EntitySpec[] {
     .map((r) => ({
       name: r.name.trim(),
       kind: r.kind || 'text',
+      occurrence: r.occurrence || 'single',
       hints: r.hints.trim(),
+      examples: (r.examples || []).map((ex) => ({
+        landmark: ex.landmark?.text,
+        label: ex.label?.text,
+        value: ex.value?.text,
+      })),
     }))
 }
 
@@ -68,16 +82,31 @@ function prettyModelRaw(raw: string): string {
   }
 }
 
+function normalizeForMatch(s: string): string {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[\s\r\n\t]+/g, ' ')
+    .replace(/[^a-z0-9.,$/-]/g, '')
+    .trim()
+}
+
 export default function App() {
   const [upload, setUpload] = useState<UploadResponse | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [entities, setEntities] = useState<EntityForm[]>([
-    { id: '1', name: 'Invoice Number', kind: 'id', hints: '' },
+    { id: '1', name: 'Invoice Number', kind: 'id', occurrence: 'single', hints: '', examples: [] },
   ])
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState(DEFAULT_OLLAMA_MODEL)
   const [result, setResult] = useState<RegexGenerateResponse | null>(null)
+  const [validationUpload, setValidationUpload] = useState<UploadResponse | null>(null)
+  const [validation, setValidation] = useState<{ matches: Record<string, string[]>; errors: Record<string, string> } | null>(null)
+  const [validationPage, setValidationPage] = useState(1)
+  const [validationBoxesDpi, setValidationBoxesDpi] = useState(200)
+  const [validationOcrView, setValidationOcrView] = useState<OcrBoxesResponse | null>(null)
+  const [showValidationHighlights, setShowValidationHighlights] = useState(true)
+  const [highlightBoxIds, setHighlightBoxIds] = useState<Set<string>>(new Set())
   const [copiedEntity, setCopiedEntity] = useState<string | null>(null)
   const [rawPanelOpen, setRawPanelOpen] = useState(true)
   const [extractionMode, setExtractionMode] = useState<'scan' | 'auto' | 'embedded'>('scan')
@@ -160,6 +189,98 @@ export default function App() {
     }
   }, [extractionMode, ocrEngine, ocrDpi, docMode, ocrDpiAnnotate])
 
+  const onValidationFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]
+    if (!f) return
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Uploading validation PDF and extracting text…')
+    setValidation(null)
+    setValidationOcrView(null)
+    setHighlightBoxIds(new Set())
+    try {
+      const u = await uploadPdf(f, {
+        extractionMode: extractionMode,
+        ocrEngine: ocrEngine,
+        ocrDpi: ocrDpi,
+      })
+      setValidationUpload(u)
+      setValidationPage(1)
+    } catch (er: unknown) {
+      setErr(String(er))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }, [extractionMode, ocrEngine, ocrDpi])
+
+  const loadValidationOcrPage = async (page: number) => {
+    if (!validationUpload) return
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Loading validation OCR boxes…')
+    try {
+      const v = await getOcrBoxes({ upload_id: validationUpload.upload_id, page, dpi: validationBoxesDpi })
+      setValidationPage(page)
+      setValidationOcrView(v)
+    } catch (e: unknown) {
+      setErr(String(e))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
+  const runValidate = async () => {
+    if (!validationUpload?.full_text) {
+      setErr('Upload a validation PDF first.')
+      return
+    }
+    if (!result?.patterns?.length) {
+      setErr('Generate patterns first.')
+      return
+    }
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Validating regex patterns on the validation document…')
+    try {
+      const out = await validateRegex({
+        full_text: validationUpload.full_text,
+        patterns: result.patterns as RegexPatternItem[],
+      })
+      setValidation(out)
+    } catch (e: unknown) {
+      setErr(String(e))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
+  useEffect(() => {
+    if (!validation || !validationOcrView || !showValidationHighlights) {
+      setHighlightBoxIds(new Set())
+      return
+    }
+    const want = new Set<string>()
+    const boxes = validationOcrView.boxes || []
+    const normBox = boxes.map((b) => ({ id: b.id, t: normalizeForMatch(b.text) }))
+
+    const valsAll = Object.values(validation.matches || {}).flat()
+    for (const v of valsAll) {
+      const nv = normalizeForMatch(v)
+      if (!nv) continue
+      // Prefer exact normalized match
+      let hit = normBox.find((b) => b.t === nv)
+      if (!hit) {
+        // Containment (handles extra punctuation/spaces)
+        hit = normBox.find((b) => b.t && (b.t.includes(nv) || nv.includes(b.t)))
+      }
+      if (hit) want.add(hit.id)
+    }
+    setHighlightBoxIds(want)
+  }, [validation, validationOcrView, showValidationHighlights])
+
   const loadOcrPage = async (page: number) => {
     if (!upload) return
     setErr(null)
@@ -207,7 +328,7 @@ export default function App() {
   const addEntity = () => {
     setEntities((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), name: '', kind: 'text', hints: '' },
+      { id: crypto.randomUUID(), name: '', kind: 'text', occurrence: 'single', hints: '' },
     ])
   }
 
@@ -321,7 +442,7 @@ export default function App() {
               }}
             >
               <option value="text">Extract text</option>
-              <option value="annotate">Annotate OCR boxes (MVP)</option>
+              <option value="annotate">Annotate</option>
             </select>
           </label>
           <label>
@@ -504,6 +625,19 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              <label className="entity-kind-label">
+                Occurrence
+                <select
+                  value={row.occurrence}
+                  onChange={(e) =>
+                    updateEntity(row.id, { occurrence: e.target.value as 'single' | 'multiple' })
+                  }
+                  aria-label="Entity occurrence"
+                >
+                  <option value="single">Single on page</option>
+                  <option value="multiple">Multiple on page</option>
+                </select>
+              </label>
               <button type="button" className="btn ghost" onClick={() => removeEntity(row.id)} title="Remove">
                 ✕
               </button>
@@ -665,6 +799,127 @@ export default function App() {
           </details>
         </section>
       )}
+
+      <section className="card">
+        <h2>5. Validation</h2>
+        <p className="hint">
+          Upload a similar document and check whether the generated patterns extract the intended entities.
+        </p>
+        <label className="file">
+          <input type="file" accept="application/pdf" onChange={onValidationFile} disabled={busy} />
+          <span>{validationUpload ? `Validation: ${validationUpload.filename}` : 'Choose validation PDF'}</span>
+        </label>
+        {validationUpload && (
+          <p className="meta">
+            {validationUpload.pages} page(s) · {validationUpload.extraction_method}
+            {validationUpload.full_text.length > 0 && ` · ${validationUpload.full_text.length} characters`}
+          </p>
+        )}
+        <div className="actions">
+          <button type="button" className="btn primary" onClick={runValidate} disabled={busy || !validationUpload}>
+            Validate patterns
+          </button>
+          <button
+            type="button"
+            className="btn secondary"
+            onClick={() => loadValidationOcrPage(validationPage)}
+            disabled={busy || !validationUpload}
+          >
+            Load boxes
+          </button>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showValidationHighlights}
+              onChange={(e) => setShowValidationHighlights(e.target.checked)}
+            />{' '}
+            Highlight matches
+          </label>
+        </div>
+
+        {validationUpload && (
+          <div className="row">
+            <label>
+              Boxes DPI
+              <input
+                type="number"
+                min={100}
+                max={400}
+                step={50}
+                value={validationBoxesDpi}
+                onChange={(e) => setValidationBoxesDpi(Number(e.target.value) || 200)}
+                disabled={busy}
+              />
+            </label>
+          </div>
+        )}
+
+        {validationUpload && validationOcrView && (
+          <div className="annotate">
+            <div className="annotate-toolbar">
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => loadValidationOcrPage(Math.max(1, validationPage - 1))}
+                disabled={busy || validationPage <= 1}
+              >
+                Prev page
+              </button>
+              <div className="annotate-page">
+                Page {validationPage} / {validationUpload.pages}
+              </div>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => loadValidationOcrPage(Math.min(validationUpload.pages, validationPage + 1))}
+                disabled={busy || validationPage >= validationUpload.pages}
+              >
+                Next page
+              </button>
+            </div>
+
+            <div className="ocr-canvas" style={{ aspectRatio: `${validationOcrView.width} / ${validationOcrView.height}` }}>
+              <img
+                className="ocr-image"
+                src={`data:image/png;base64,${validationOcrView.image_base64}`}
+                alt={`Validation OCR page ${validationOcrView.page}`}
+              />
+              {validationOcrView.boxes.map((b) => {
+                const left = (b.x0 / validationOcrView.width) * 100
+                const top = (b.y0 / validationOcrView.height) * 100
+                const w = ((b.x1 - b.x0) / validationOcrView.width) * 100
+                const h = ((b.y1 - b.y0) / validationOcrView.height) * 100
+                const isHit = showValidationHighlights && highlightBoxIds.has(b.id)
+                return (
+                  <div
+                    key={`v-${b.id}`}
+                    className={`ocr-box ${isHit ? 'highlight' : ''}`}
+                    style={{ left: `${left}%`, top: `${top}%`, width: `${w}%`, height: `${h}%` }}
+                    title={b.text}
+                  />
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {validation && (
+          <div className="validation">
+            {Object.entries(validation.matches).map(([entity, vals]) => (
+              <div key={entity} className="validation-row">
+                <div className="validation-entity">{entity}</div>
+                {validation.errors[entity] ? (
+                  <div className="validation-error">Regex error: {validation.errors[entity]}</div>
+                ) : (
+                  <div className="validation-values">
+                    {vals && vals.length ? vals.join(' · ') : '(no matches)'}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
         <footer className="footer">
           <p>

@@ -55,7 +55,9 @@ async function fetchJson<T>(
 export type EntitySpec = {
   name: string
   kind: string
+  occurrence?: 'single' | 'multiple'
   hints: string
+  examples?: Array<{ landmark?: string; label?: string; value?: string }>
 }
 
 export type UploadResponse = {
@@ -129,6 +131,22 @@ export type RegexGenerateResponse = {
   patterns: RegexPatternItem[]
   raw_model_text: string
   ollama_model: string
+}
+
+export type RegexValidateResponse = {
+  matches: Record<string, string[]>
+  errors: Record<string, string>
+}
+
+export async function validateRegex(body: {
+  full_text: string
+  patterns: RegexPatternItem[]
+}): Promise<RegexValidateResponse> {
+  return fetchJson(`${BASE}/api/validate-regex`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 }
 
 export async function generateRegex(body: {
