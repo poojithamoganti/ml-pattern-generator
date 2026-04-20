@@ -46,6 +46,12 @@ def load_entities(tx, rows: list[dict[str, Any]]) -> None:
 
 
 def load_patterns(tx, rows: list[dict[str, Any]]) -> None:
+    # Neo4j cannot store nested maps in properties; spaCy matcher specs are JSON-encoded.
+    payload = []
+    for row in rows:
+        r = dict(row)
+        r["spacyPatternJson"] = json.dumps(row.get("spacyPattern") or [])
+        payload.append(r)
     tx.run(
         """
         UNWIND $rows AS row
@@ -53,9 +59,12 @@ def load_patterns(tx, rows: list[dict[str, Any]]) -> None:
         SET p.name = row.name,
             p.type = row.type,
             p.regexPattern = row.regexPattern,
-            p.spacyPattern = coalesce(row.spacyPattern, [])
+            p.stringPattern = row.stringPattern,
+            p.stringPatternRegex = row.stringPatternRegex,
+            p.spacyPatternJson = row.spacyPatternJson,
+            p.source = coalesce(row.source, 'kb')
         """,
-        rows=rows,
+        rows=payload,
     )
     tx.run(
         """

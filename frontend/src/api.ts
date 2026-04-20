@@ -135,6 +135,10 @@ export type RegexGenerateResponse = {
   /** Second-pass LLM (optional) */
   refinement_raw_model_text?: string
   refinement_model?: string
+  /** Graph RAG (Faiss + Neo4j) when use_graph_rag was true */
+  graph_rag_used?: boolean
+  graph_rag_error?: string
+  graph_rag_hits?: Array<{ score: number; kind: string; primary_id: string; vector_index?: number }>
 }
 
 export type RegexValidateResponse = {
@@ -161,12 +165,26 @@ export async function generateRegex(body: {
   model: string | null
   /** Second Ollama model: validate/repair first-pass patterns on primary OCR */
   refinement_model?: string | null
+  /** Retrieve similar KB rows (Faiss) and expand in Neo4j — requires backend env */
+  use_graph_rag?: boolean
 }): Promise<RegexGenerateResponse> {
   return fetchJson(`${BASE}/api/generate-regex`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+export type GraphRagStatus = {
+  enabled_flag: boolean
+  index_dir: string
+  index_ready: boolean
+  neo4j_configured: boolean
+  neo4j_uri: string
+}
+
+export async function getGraphRagStatus(): Promise<GraphRagStatus> {
+  return fetchJson(`${BASE}/api/graph-rag/status`, { method: 'GET', headers: {} })
 }
 
 export async function listModels(): Promise<{ models: string[]; error?: string }> {

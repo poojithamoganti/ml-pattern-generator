@@ -104,6 +104,7 @@ USER_TEMPLATE = """Document text (one or more samples; may be truncated):
 ---
 {text}
 ---
+{kb_context_block}
 {annotation_focus}
 For each entity below, produce ONE primary regex pattern that would generalize to similar documents (same vendor/layout family), not only this page.
 When the document text or examples show how the label connects to the value (spaces, $, comma decimals, colons), reflect that in the regex.
@@ -747,6 +748,9 @@ async def refine_regex_patterns_with_llm(
         ollama_model=first_pass.ollama_model,
         refinement_raw_model_text=raw,
         refinement_model=refinement_model,
+        graph_rag_used=first_pass.graph_rag_used,
+        graph_rag_error=first_pass.graph_rag_error,
+        graph_rag_hits=first_pass.graph_rag_hits,
     )
 
 
@@ -851,6 +855,7 @@ async def generate_regex_patterns(
     model: str | None,
     extra_instructions: str,
     additional_full_texts: list[str] | None = None,
+    kb_context: str | None = None,
 ) -> RegexGenerateResponse:
     model_name = model or DEFAULT_LLM_MODEL
     text = _combine_document_samples(full_text, additional_full_texts)
@@ -864,8 +869,18 @@ async def generate_regex_patterns(
     if extra_instructions.strip():
         extra = "Additional user instructions:\n" + extra_instructions.strip()
 
+    kb_context_block = ""
+    if kb_context and kb_context.strip():
+        kb_context_block = (
+            "Retrieved knowledge base (similar patterns/rules/templates from your Neo4j library; "
+            "use as structural reference — still prioritize the document text and user entities):\n---\n"
+            + kb_context.strip()
+            + "\n---\n\n"
+        )
+
     user_content = USER_TEMPLATE.format(
         text=text,
+        kb_context_block=kb_context_block,
         annotation_focus=annotation_focus,
         entity_block=entity_block,
         extra=extra,

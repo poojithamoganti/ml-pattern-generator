@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -38,6 +40,10 @@ class RegexGenerateRequest(BaseModel):
         default=None,
         description="Rare override for refinement model; server defaults to OLLAMA_REFINEMENT_MODEL (qwen2.5:7b).",
     )
+    use_graph_rag: bool = Field(
+        default=False,
+        description="If true and GRAPH_RAG_ENABLED + index exist, retrieve similar KB rows (Faiss) and expand in Neo4j.",
+    )
 
     @field_validator("additional_full_texts", mode="before")
     @classmethod
@@ -76,6 +82,20 @@ class RegexGenerateResponse(BaseModel):
     ollama_model: str = ""
     refinement_raw_model_text: str = ""
     refinement_model: str = ""
+    graph_rag_used: bool = False
+    graph_rag_error: str = ""
+    graph_rag_hits: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class GraphRagPreviewRequest(BaseModel):
+    q: str = Field(..., min_length=1, description="Retrieval query text")
+    k: int = Field(default=8, ge=1, le=50)
+
+
+class GraphRagPreviewResponse(BaseModel):
+    context: str
+    hits: list[dict[str, Any]]
+    error: str = ""
 
 
 class RegexBatchRequest(BaseModel):
@@ -83,6 +103,7 @@ class RegexBatchRequest(BaseModel):
     entities: list[EntitySpec] = Field(..., min_length=1)
     models: list[str] = Field(..., min_length=1, description="Ollama model names to run in parallel")
     extra_instructions: str = ""
+    use_graph_rag: bool = False
 
 
 class RegexBatchResponse(BaseModel):

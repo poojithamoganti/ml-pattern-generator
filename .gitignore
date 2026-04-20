@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 backend/data/uploads/
 .env
+graph-db/vector-index/

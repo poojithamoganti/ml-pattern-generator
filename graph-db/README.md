@@ -66,3 +66,22 @@ Paths can be omitted for any file you do not import yet.
 ## Linking standalone Rule to Template NerRule
 
 If your data uses a shared key between `rules.json` and template `nerRules`, add a property on both and `MATCH` + `MERGE` that relationship in a follow-up migration. The samples you shared used different ID shapes; this repo does not assume a join key.
+
+## Vector index (Faiss, local)
+
+After Neo4j is populated, build a **Faiss** index for semantic search. The script embeds **Entity**, **Pattern**, **Rule**, **Template**, and **NerRule** rows (one vector per row) using `sentence-transformers` (default: `all-MiniLM-L6-v2`). Output goes to `graph-db/vector-index/` (gitignored): `vectors.faiss`, `metadata.jsonl`, `config.json`.
+
+```bash
+cd graph-db
+.venv\Scripts\activate
+pip install -r requirements.txt
+set NEO4J_PASSWORD=your-password
+python scripts/vector_index.py build --out vector-index
+python scripts/vector_index.py search --out vector-index --q "Chase payment micro line" -k 5
+```
+
+Optional: `EMBEDDING_MODEL` env overrides the sentence-transformers model name. Each `metadata.jsonl` line stores `kind`, `primary_id`, full embed text, and `extra` (Neo4j label + id) for Graph RAG to map hits back to Cypher.
+
+### Backend (Regex Pattern Lab)
+
+The FastAPI app can inject this context into Ollama when **Graph RAG** is enabled: set `GRAPH_RAG_ENABLED=1`, `NEO4J_PASSWORD`, and optionally `GRAPH_RAG_INDEX_DIR` in `backend/.env`, restart uvicorn, then use the **“Graph RAG (Faiss + Neo4j)”** checkbox in the UI. Endpoints: `GET /api/graph-rag/status`, `POST /api/graph-rag/preview` (debug).

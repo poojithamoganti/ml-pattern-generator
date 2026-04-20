@@ -16,7 +16,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import (
     EXTRACTION_MODE,
+    GRAPH_RAG_ENABLED,
+    GRAPH_RAG_INDEX_DIR,
+    GRAPH_RAG_MAX_CONTEXT_CHARS,
+    GRAPH_RAG_VECTOR_K,
     MAX_UPLOAD_MB,
+    NEO4J_PASSWORD,
+    NEO4J_URI,
+    NEO4J_USER,
     OCR_DPI,
     OCR_ENGINE,
     OCR_USE_GPU,
@@ -25,6 +32,8 @@ from app.config import (
     UPLOAD_DIR,
 )
 from app.schemas import (
+    GraphRagPreviewRequest,
+    GraphRagPreviewResponse,
     RegexBatchRequest,
     RegexBatchResponse,
     RegexGenerateRequest,
@@ -34,6 +43,7 @@ from app.schemas import (
     RegexValidateResponse,
     UploadResponse,
 )
+from app.services.graph_rag import build_retrieval_query, run_graph_rag_safe
 from app.services.llm_regex import generate_regex_patterns, refine_regex_patterns_with_llm
 from app.services.pdf_extract import extract_document, save_upload
 from app.services.ocr_boxes import ocr_boxes_for_upload
@@ -68,6 +78,27 @@ def _strip_invisible(s: str) -> str:
     for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
         s = s.replace(ch, "")
     return s.strip()
+
+
+def _graph_rag_context_for_request(
+    body: RegexGenerateRequest,
+) -> tuple[str | None, list[dict], str]:
+    """Build KB context string for the LLM; returns (context, hits, error)."""
+    if not body.use_graph_rag or not GRAPH_RAG_ENABLED:
+        return None, [], ""
+    names = [e.name for e in body.entities if e.name.strip()]
+    hints = "\n".join((e.hints or "") for e in body.entities)
+    snippet = (body.full_text or "")[:3000]
+    rq = build_retrieval_query(names, hints, snippet)
+    return run_graph_rag_safe(
+        index_dir=GRAPH_RAG_INDEX_DIR,
+        neo4j_uri=NEO4J_URI,
+        neo4j_user=NEO4J_USER,
+        neo4j_password=NEO4J_PASSWORD,
+        retrieval_query=rq,
+        vector_k=GRAPH_RAG_VECTOR_K,
+        max_context_chars=GRAPH_RAG_MAX_CONTEXT_CHARS,
+    )
 
 
 def _raise_model_error(exc: BaseException) -> None:
@@ -110,6 +141,39 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/graph-rag/status")
+def graph_rag_status():
+    """Whether Graph RAG is configured and the vector index directory exists."""
+    idx = GRAPH_RAG_INDEX_DIR
+    has_cfg = (idx / "config.json").is_file() and (idx / "vectors.faiss").is_file()
+    return {
+        "enabled_flag": GRAPH_RAG_ENABLED,
+        "index_dir": str(idx.resolve()),
+        "index_ready": has_cfg,
+        "neo4j_configured": bool(NEO4J_PASSWORD),
+        "neo4j_uri": NEO4J_URI,
+    }
+
+
+@app.post("/api/graph-rag/preview", response_model=GraphRagPreviewResponse)
+def graph_rag_preview(body: GraphRagPreviewRequest):
+    """Debug: run vector search (+ Neo4j expand if password set) without calling the LLM."""
+    if not GRAPH_RAG_ENABLED:
+        return GraphRagPreviewResponse(context="", hits=[], error="GRAPH_RAG_ENABLED is false in server env.")
+    ctx, hits, err = run_graph_rag_safe(
+        index_dir=GRAPH_RAG_INDEX_DIR,
+        neo4j_uri=NEO4J_URI,
+        neo4j_user=NEO4J_USER,
+        neo4j_password=NEO4J_PASSWORD,
+        retrieval_query=body.q.strip(),
+        vector_k=body.k,
+        max_context_chars=GRAPH_RAG_MAX_CONTEXT_CHARS,
+    )
+    if err or not ctx:
+        return GraphRagPreviewResponse(context="", hits=hits, error=err or "empty context")
+    return GraphRagPreviewResponse(context=ctx, hits=hits, error="")
 
 
 @app.get("/api/models")
@@ -209,13 +273,42 @@ async def get_ocr_boxes(
 async def generate_regex_batch(body: RegexBatchRequest):
     """Run the same prompt against several Ollama models (compare generalization ideas)."""
 
+    kb: str | None = None
+    g_err = ""
+    g_hits: list[dict] = []
+    if body.use_graph_rag and GRAPH_RAG_ENABLED:
+        rq = build_retrieval_query(
+            [e.name for e in body.entities],
+            "\n".join((e.hints or "") for e in body.entities),
+            (body.full_text or "")[:3000],
+        )
+        kb, g_hits, g_err = await asyncio.to_thread(
+            lambda: run_graph_rag_safe(
+                index_dir=GRAPH_RAG_INDEX_DIR,
+                neo4j_uri=NEO4J_URI,
+                neo4j_user=NEO4J_USER,
+                neo4j_password=NEO4J_PASSWORD,
+                retrieval_query=rq,
+                vector_k=GRAPH_RAG_VECTOR_K,
+                max_context_chars=GRAPH_RAG_MAX_CONTEXT_CHARS,
+            )
+        )
+
     async def one(m: str) -> RegexGenerateResponse:
-        return await generate_regex_patterns(
+        gen = await generate_regex_patterns(
             body.full_text,
             body.entities,
             m,
             body.extra_instructions,
             [],
+            kb_context=kb,
+        )
+        return gen.model_copy(
+            update={
+                "graph_rag_used": bool(body.use_graph_rag and GRAPH_RAG_ENABLED),
+                "graph_rag_error": g_err if body.use_graph_rag else "",
+                "graph_rag_hits": g_hits if body.use_graph_rag else [],
+            }
         )
 
     try:
@@ -232,6 +325,11 @@ async def generate_regex_batch(body: RegexBatchRequest):
 async def generate_regex(body: RegexGenerateRequest):
     if not body.entities:
         raise HTTPException(400, "At least one entity is required.")
+    kb_ctx: str | None = None
+    g_hits: list[dict] = []
+    g_err = ""
+    if body.use_graph_rag and GRAPH_RAG_ENABLED:
+        kb_ctx, g_hits, g_err = await asyncio.to_thread(_graph_rag_context_for_request, body)
     try:
         gen = await generate_regex_patterns(
             body.full_text,
@@ -239,6 +337,14 @@ async def generate_regex(body: RegexGenerateRequest):
             body.model,
             body.extra_instructions,
             body.additional_full_texts,
+            kb_context=kb_ctx,
+        )
+        gen = gen.model_copy(
+            update={
+                "graph_rag_used": bool(body.use_graph_rag and GRAPH_RAG_ENABLED),
+                "graph_rag_error": g_err if body.use_graph_rag else "",
+                "graph_rag_hits": g_hits if body.use_graph_rag else [],
+            }
         )
         ref_model = (body.refinement_model or "").strip() or OLLAMA_REFINEMENT_MODEL
         if ref_model:

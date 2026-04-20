@@ -44,3 +44,14 @@ OCR_ENGINE = os.getenv("OCR_ENGINE", "docling").lower()
 
 # Higher DPI helps thin rules and small type in tables (GPU recommended)
 OCR_DPI = int(os.getenv("OCR_DPI", "300"))
+
+# --- Graph RAG (Faiss + Neo4j; built via graph-db/scripts/vector_index.py) ---
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_GRAPH_RAG_INDEX = _PROJECT_ROOT / "graph-db" / "vector-index"
+GRAPH_RAG_ENABLED = os.getenv("GRAPH_RAG_ENABLED", "0").lower() in ("1", "true", "yes")
+GRAPH_RAG_INDEX_DIR = Path(os.getenv("GRAPH_RAG_INDEX_DIR", str(_DEFAULT_GRAPH_RAG_INDEX)))
+GRAPH_RAG_VECTOR_K = int(os.getenv("GRAPH_RAG_VECTOR_K", "12"))
+GRAPH_RAG_MAX_CONTEXT_CHARS = int(os.getenv("GRAPH_RAG_MAX_CONTEXT_CHARS", "20000"))
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687").rstrip("/")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "").strip()

@@ -8,7 +8,7 @@ SET p.name = row.name,
     p.regexPattern = row.regexPattern,
     p.stringPattern = row.stringPattern,
     p.stringPatternRegex = row.stringPatternRegex,
-    p.spacyPattern = coalesce(row.spacyPattern, []),
+    p.spacyPatternJson = apoc.convert.toJson(coalesce(row.spacyPattern, [])),
     p.source = coalesce(p.source, 'kb')
 WITH p, row
 FOREACH (entityId IN CASE WHEN row.entities IS NULL THEN [] ELSE row.entities END |

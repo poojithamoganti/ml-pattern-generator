@@ -621,6 +621,35 @@ label {
   max-width: 42rem;
 }
 
+.graph-rag-check {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  margin-bottom: 0.15rem;
+}
+
+.graph-rag-check input {
+  margin: 0;
+}
+
+.graph-rag-warn {
+  margin: 0.35rem 0 0;
+  max-width: 48rem;
+  color: var(--warn, #b45309);
+}
+
+.graph-rag-hits {
+  margin: 0.5rem 0 0.75rem;
+  font-size: 0.85rem;
+}
+
+.graph-rag-hits ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.25rem;
+}
+
 .output-header {
   display: flex;
   flex-wrap: wrap;

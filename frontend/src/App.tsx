@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   generateRegex,
+  getGraphRagStatus,
   getOcrBoxes,
   listModels,
   ollamaHealth,
@@ -233,6 +234,8 @@ export default function App() {
   const [busyHint, setBusyHint] = useState('')
   const [elapsedSec, setElapsedSec] = useState(0)
   const [ollamaWarn, setOllamaWarn] = useState<string | null>(null)
+  const [useGraphRag, setUseGraphRag] = useState(false)
+  const [graphRagHint, setGraphRagHint] = useState<string | null>(null)
 
   const loadOcrPage = useCallback(
     async (page: number, docIdOverride?: string, dpiOverride?: number) => {
@@ -301,6 +304,28 @@ export default function App() {
         return list[0] ?? prev
       })
     })
+  }, [])
+
+  useEffect(() => {
+    getGraphRagStatus()
+      .then((s) => {
+        if (!s.enabled_flag) {
+          setGraphRagHint('Server has GRAPH_RAG_ENABLED=0 — enable in backend .env and restart.')
+          return
+        }
+        if (!s.index_ready) {
+          setGraphRagHint(
+            `No vector index at ${s.index_dir} — run: cd graph-db && python scripts/vector_index.py build`,
+          )
+          return
+        }
+        if (!s.neo4j_configured) {
+          setGraphRagHint('Neo4j password not set — retrieval uses embed text only (set NEO4J_PASSWORD for graph expand).')
+          return
+        }
+        setGraphRagHint(null)
+      })
+      .catch(() => setGraphRagHint('Could not load Graph RAG status from API.'))
   }, [])
 
   const onFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -583,6 +608,7 @@ export default function App() {
         additional_full_texts: extraSamples.map((s) => s.full_text),
         entities: specs,
         model: model || null,
+        use_graph_rag: useGraphRag,
       })
       setResult(gen)
       setCopiedEntity(null)
@@ -1087,10 +1113,20 @@ export default function App() {
               ))}
             </select>
           </label>
+          <label className="graph-rag-check">
+            <input
+              type="checkbox"
+              checked={useGraphRag}
+              onChange={(e) => setUseGraphRag(e.target.checked)}
+              disabled={busy}
+            />
+            Graph RAG (Faiss + Neo4j)
+          </label>
           <button type="button" className="btn primary" onClick={runGenerate} disabled={busy}>
             Generate patterns
           </button>
         </div>
+        {graphRagHint && useGraphRag && <p className="muted small graph-rag-warn">{graphRagHint}</p>}
         <p className="muted small model-refine-hint">
           After generation, the API runs a <strong>refinement</strong> pass (default model{' '}
           <code>qwen2.5:7b</code>) using real Python matches on your primary OCR — set{' '}
@@ -1124,7 +1160,23 @@ export default function App() {
           <p className="output-meta">
             Generator: {result.ollama_model}
             {result.refinement_model ? ` · Refinement: ${result.refinement_model}` : ''}
+            {result.graph_rag_used ? ' · Graph RAG: on' : ''}
+            {result.graph_rag_error ? ` · Graph RAG note: ${result.graph_rag_error}` : ''}
           </p>
+          {result.graph_rag_hits && result.graph_rag_hits.length > 0 && (
+            <details className="graph-rag-hits">
+              <summary>
+                Graph RAG hits ({result.graph_rag_hits.length}) — similar KB rows sent to the model
+              </summary>
+              <ul>
+                {result.graph_rag_hits.map((h, i) => (
+                  <li key={`${h.kind}-${h.primary_id}-${i}`}>
+                    <code>{h.kind}</code> · {h.primary_id} · score {h.score?.toFixed?.(4) ?? h.score}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
           <ul className="patterns">
             {result.patterns.map((p) => (
               <li key={p.entity}>
