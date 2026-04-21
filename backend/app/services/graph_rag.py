@@ -1,8 +1,24 @@
 """
-Graph RAG: Faiss vector search over KB chunks + Neo4j neighborhood expansion for LLM context.
+Graph RAG: hybrid retrieval over the KB vector index + Neo4j expansion.
 
-Expects the same artifacts as ``graph-db/scripts/vector_index.py build``:
-  ``vectors.faiss``, ``metadata.jsonl``, ``config.json`` under GRAPH_RAG_INDEX_DIR.
+**Previous / baseline (GRAPH_RAG_HYBRID=0):** single dense pass — Faiss ``IndexFlatIP``
+on L2-normalized MiniLM embeddings (inner product = cosine similarity). One query
+string embeds the whole prompt (entities + hints + long OCR excerpt), which often
+*dilutes* the vector and misses regex-heavy KB rows.
+
+**Default (GRAPH_RAG_HYBRID=1):** *Reciprocal Rank Fusion* (RRF) of three ranked lists:
+  1. **BM25** (``rank_bm25``) over the same per-row ``text`` stored in ``metadata.jsonl``
+     — strong lexical match on ids, rule names, and literal phrases.
+  2. **Dense (entity-focused)** — embeds only the block *before* ``Document excerpt:``
+     (entities + hints), so semantics align with *field* intent, not raw OCR noise.
+  3. **Dense (full query)** — embeds the full retrieval string including a *short*
+     doc snippet (``GRAPH_RAG_DOC_SNIPPET_CHARS``), for layout/context alignment.
+
+RRF merges ranks with score ``sum 1/(RRF_K + rank)`` (classic fusion; ``RRF_K``≈60).
+Final top-``k`` rows are expanded in Neo4j when credentials are set.
+
+Re-indexing: changing the embedding model in ``vector_index.py`` requires rebuilding
+``vectors.faiss``; hybrid BM25 uses only ``metadata.jsonl`` text.
 """
 
 from __future__ import annotations
@@ -16,10 +32,37 @@ from typing import Any
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
+from app.config import (
+    GRAPH_RAG_BM25_BRANCH_K,
+    GRAPH_RAG_DENSE_BRANCH_K,
+    GRAPH_RAG_DOC_SNIPPET_CHARS,
+    GRAPH_RAG_HYBRID,
+    GRAPH_RAG_RRF_K,
+)
+
 logger = logging.getLogger(__name__)
 
 _faiss = None
 _ST = None
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens for BM25."""
+    return re.findall(r"[a-z0-9_]+", (text or "").lower())
+
+
+def _reciprocal_rank_fusion(
+    rankings: list[list[int]],
+    k_const: int,
+) -> dict[int, float]:
+    """Cormack et al.-style RRF: fused_score(d) = sum_i 1/(k + rank_i(d))."""
+    scores: dict[int, float] = {}
+    for rks in rankings:
+        if not rks:
+            continue
+        for rank, doc_id in enumerate(rks, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k_const + rank)
+    return scores
 
 
 def _faiss_mod():
@@ -68,6 +111,7 @@ class GraphRagStore:
                 line = line.strip()
                 if line:
                     self._metadata.append(json.loads(line))
+        self._bm25 = None  # lazy: BM25Okapi over tokenized metadata text
         faiss = _faiss_mod()
         idx_name = self.cfg.get("files", {}).get("faiss", "vectors.faiss")
         self._index = faiss.read_index(str(self.index_dir / idx_name))
@@ -81,6 +125,7 @@ class GraphRagStore:
             self.load()
 
     def search(self, query: str, k: int) -> list[tuple[int, float]]:
+        """Single-query dense retrieval (cosine via normalized IP)."""
         self.ensure_loaded()
         assert self._model is not None and self._index is not None
         k = min(k, int(self._index.ntotal))
@@ -96,6 +141,62 @@ class GraphRagStore:
                 continue
             out.append((int(idx), float(score)))
         return out
+
+    def _ensure_bm25(self) -> None:
+        if self._bm25 is not None:
+            return
+        from rank_bm25 import BM25Okapi
+
+        corpus_tokens: list[list[str]] = []
+        for row in self._metadata:
+            toks = _tokenize(str(row.get("text", "")))
+            corpus_tokens.append(toks if toks else ["emptydoc"])
+        self._bm25 = BM25Okapi(corpus_tokens)
+
+    def search_hybrid(
+        self,
+        query_full: str,
+        query_entity_focus: str,
+        final_k: int,
+    ) -> list[tuple[int, float]]:
+        """
+        BM25 + dense(entity) + dense(full) fused with RRF; returns (index, rrf_score).
+        """
+        self.ensure_loaded()
+        assert self._model is not None and self._index is not None
+        ntotal = int(self._index.ntotal)
+        if ntotal == 0 or final_k <= 0:
+            return []
+
+        branch = min(GRAPH_RAG_DENSE_BRANCH_K, ntotal)
+        bm25_take = min(GRAPH_RAG_BM25_BRANCH_K, ntotal)
+
+        self._ensure_bm25()
+        assert self._bm25 is not None
+
+        q_tok = _tokenize(query_full)
+        if len(q_tok) < 2:
+            q_tok = _tokenize(query_entity_focus) or ["query"]
+        bm25_scores = self._bm25.get_scores(q_tok)
+        bm25_order = sorted(
+            range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+        )[:bm25_take]
+
+        dense_full_order = [i for i, _ in self.search(query_full, branch)]
+        ent_q = (query_entity_focus or "").strip()
+        full_q = (query_full or "").strip()
+        rankings: list[list[int]] = [bm25_order]
+        if ent_q and ent_q != full_q:
+            rankings.append([i for i, _ in self.search(ent_q, branch)])
+        rankings.append(dense_full_order)
+
+        rrf_scores = _reciprocal_rank_fusion(rankings, GRAPH_RAG_RRF_K)
+        ranked_docs = sorted(rrf_scores.keys(), key=lambda d: rrf_scores[d], reverse=True)[
+            :final_k
+        ]
+        if not ranked_docs:
+            return self.search(query_full, final_k)
+        return [(idx, rrf_scores[idx]) for idx in ranked_docs]
 
 
 def _truncate(s: str, n: int = 4000) -> str:
@@ -257,11 +358,31 @@ def expand_neo4j(driver, kind: str, primary_id: str) -> str:
     return "\n".join(lines)
 
 
-def build_retrieval_query(entity_names: list[str], hints: str, doc_snippet: str) -> str:
+def split_retrieval_query(retrieval_query: str) -> tuple[str, str]:
+    """
+    Split a query from build_retrieval_query into (full, entity_focused_head).
+    The head excludes the long OCR block so dense retrieval can emphasize entities/hints.
+    """
+    marker = "Document excerpt:"
+    q = (retrieval_query or "").strip()
+    if marker in q:
+        head = q.split(marker, 1)[0].strip()
+        return q, head if head else q
+    return q, q
+
+
+def build_retrieval_query(
+    entity_names: list[str],
+    hints: str,
+    doc_snippet: str,
+    *,
+    doc_max_chars: int | None = None,
+) -> str:
+    max_chars = doc_max_chars if doc_max_chars is not None else GRAPH_RAG_DOC_SNIPPET_CHARS
     parts = [f"Entities: {', '.join(entity_names)}."]
     if hints.strip():
         parts.append(f"Hints: {hints.strip()[:2000]}")
-    sn = re.sub(r"\s+", " ", doc_snippet)[:2500]
+    sn = re.sub(r"\s+", " ", doc_snippet)[:max_chars]
     if sn:
         parts.append(f"Document excerpt: {sn}")
     return "\n".join(parts)
@@ -287,7 +408,21 @@ def run_graph_rag(
         raise FileNotFoundError(f"No vector index at {index_dir} (run graph-db/scripts/vector_index.py build).")
 
     store.ensure_loaded()
-    hits_raw = store.search(retrieval_query, vector_k)
+    q_full, q_entity_focus = split_retrieval_query(retrieval_query)
+
+    if GRAPH_RAG_HYBRID:
+        hits_raw = store.search_hybrid(
+            query_full=q_full,
+            query_entity_focus=q_entity_focus,
+            final_k=vector_k,
+        )
+        logger.debug(
+            "Graph RAG hybrid: RRF fusion (BM25 + dense entity + dense full), k=%s",
+            vector_k,
+        )
+    else:
+        hits_raw = store.search(q_full, vector_k)
+        logger.debug("Graph RAG dense-only: single cosine query, k=%s", vector_k)
 
     driver = None
     if expand_neo4j_graph and neo4j_password:
@@ -310,12 +445,14 @@ def run_graph_rag(
         if not expanded.strip():
             expanded = _truncate(embed_text, 3500)
 
-        block = f"### Hit {rank} (score={score:.4f}, kind={kind}, id=`{pid}`)\n{expanded}"
+        metric = "rrf" if GRAPH_RAG_HYBRID else "cos_ip"
+        block = f"### Hit {rank} ({metric}={score:.4f}, kind={kind}, id=`{pid}`)\n{expanded}"
         blocks.append(block)
         hit_rows.append(
             {
                 "vector_index": idx,
                 "score": round(score, 6),
+                "score_metric": metric,
                 "kind": kind,
                 "primary_id": pid,
             }

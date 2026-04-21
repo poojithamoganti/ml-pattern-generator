@@ -5,6 +5,7 @@ Regex Pattern Lab — FastAPI backend: PDF text + Ollama-powered regex generatio
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import uuid
@@ -16,9 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import (
     EXTRACTION_MODE,
+    GRAPH_RAG_BM25_BRANCH_K,
+    GRAPH_RAG_DENSE_BRANCH_K,
+    GRAPH_RAG_DOC_SNIPPET_CHARS,
     GRAPH_RAG_ENABLED,
+    GRAPH_RAG_HYBRID,
     GRAPH_RAG_INDEX_DIR,
     GRAPH_RAG_MAX_CONTEXT_CHARS,
+    GRAPH_RAG_RRF_K,
     GRAPH_RAG_VECTOR_K,
     MAX_UPLOAD_MB,
     NEO4J_PASSWORD,
@@ -43,6 +49,17 @@ from app.schemas import (
     RegexValidateResponse,
     UploadResponse,
 )
+from app.schemas_agents import (
+    AgentDiscoverRequest,
+    AgentDiscoverResponse,
+    AgentOcrUploadResponse,
+    AgentSynthesizeRequest,
+    AgentSynthesizeResponse,
+)
+from app.services.agent_session_store import create_job
+from app.services.agents.agent1_discover import run_agent1_discover
+from app.services.agents.agent2_synthesize import run_agent2_synthesize
+from app.services.ocr_json_parser import normalize_ocr_json
 from app.services.graph_rag import build_retrieval_query, run_graph_rag_safe
 from app.services.llm_regex import generate_regex_patterns, refine_regex_patterns_with_llm
 from app.services.pdf_extract import extract_document, save_upload
@@ -127,7 +144,7 @@ def _raise_model_error(exc: BaseException) -> None:
     raise HTTPException(status_code=502, detail=msg) from exc
 
 
-app = FastAPI(title="Regex Pattern Lab", version="0.1.0")
+app = FastAPI(title="Regex Pattern Lab", version="0.2.0", description="PDF/OCR regex + agentic KB discovery")
 
 app.add_middleware(
     CORSMiddleware,
@@ -143,6 +160,85 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/agent/ocr-upload", response_model=AgentOcrUploadResponse)
+async def agent_ocr_upload(file: Annotated[UploadFile, File()]):
+    """Upload Azure-style ocr.json; returns job_id for Agent 1 / Agent 2."""
+    if not file.filename or not file.filename.lower().endswith(".json"):
+        raise HTTPException(400, "Please upload a .json file (e.g. Azure OCR export).")
+
+    raw = await file.read()
+    max_b = MAX_UPLOAD_MB * 1024 * 1024
+    if len(raw) > max_b:
+        raise HTTPException(400, f"File too large (max {MAX_UPLOAD_MB} MB).")
+
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise HTTPException(400, f"Invalid JSON: {e}") from e
+
+    try:
+        ocr = normalize_ocr_json(data)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    jid = create_job(ocr, file.filename or "ocr.json")
+    prev = ocr.full_text[:4000] + ("..." if len(ocr.full_text) > 4000 else "")
+    return AgentOcrUploadResponse(
+        job_id=jid,
+        source_name=file.filename or "ocr.json",
+        page_count=ocr.page_count,
+        line_count=len(ocr.lines),
+        char_count=len(ocr.full_text),
+        text_preview=prev,
+    )
+
+
+@app.post("/api/agent/discover", response_model=AgentDiscoverResponse)
+async def agent_discover(body: AgentDiscoverRequest):
+    """
+    Agent 1: chunk/embed OCR lines → session FAISS; per entity search KB (graph vector index) + OCR similarity.
+    """
+    try:
+        payload = await asyncio.to_thread(
+            run_agent1_discover,
+            body.job_id,
+            list(body.entities),
+            body.kb_vector_k,
+            body.ocr_chunk_k,
+        )
+        return AgentDiscoverResponse.model_validate(payload)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.exception("Agent 1 discover failed")
+        raise HTTPException(500, str(e)) from e
+
+
+@app.post("/api/agent/synthesize", response_model=AgentSynthesizeResponse)
+async def agent_synthesize(body: AgentSynthesizeRequest):
+    """Agent 2: validated annotations → structured patterns / rules / templates JSON."""
+    try:
+        env, raw, model_used = await asyncio.to_thread(
+            run_agent2_synthesize,
+            body.job_id,
+            list(body.validated),
+            body.model,
+            body.extra_instructions,
+        )
+        return AgentSynthesizeResponse(
+            job_id=body.job_id,
+            artifacts=env,
+            raw_model_text=raw,
+            ollama_model=model_used,
+            error="",
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.exception("Agent 2 synthesize failed")
+        _raise_model_error(e)
+
+
 @app.get("/api/graph-rag/status")
 def graph_rag_status():
     """Whether Graph RAG is configured and the vector index directory exists."""
@@ -154,6 +250,11 @@ def graph_rag_status():
         "index_ready": has_cfg,
         "neo4j_configured": bool(NEO4J_PASSWORD),
         "neo4j_uri": NEO4J_URI,
+        "hybrid_enabled": GRAPH_RAG_HYBRID,
+        "hybrid_rrf_k": GRAPH_RAG_RRF_K,
+        "hybrid_dense_branch_k": GRAPH_RAG_DENSE_BRANCH_K,
+        "hybrid_bm25_branch_k": GRAPH_RAG_BM25_BRANCH_K,
+        "doc_snippet_chars": GRAPH_RAG_DOC_SNIPPET_CHARS,
     }
 
 

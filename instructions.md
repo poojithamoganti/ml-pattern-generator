@@ -122,6 +122,8 @@ python graph-db\scripts\vector_index.py build --out graph-db\vector-index
 
 This creates `graph-db/vector-index/` (`vectors.faiss`, `metadata.jsonl`, `config.json`). The first run downloads the default embedding model (sentence-transformers) and may take several minutes.
 
+**Graph RAG retrieval (backend):** by default **`GRAPH_RAG_HYBRID=1`** uses **BM25** (lexical) over each row’s embed text plus **two dense** Faiss queries (entity/hints-only vs full query with a short doc snippet), merged by **Reciprocal Rank Fusion** (RRF). Set **`GRAPH_RAG_HYBRID=0`** for legacy single-query cosine only. Tune `GRAPH_RAG_DOC_SNIPPET_CHARS`, `GRAPH_RAG_DENSE_BRANCH_K`, `GRAPH_RAG_BM25_BRANCH_K`, `GRAPH_RAG_RRF_K` in `backend/.env`.
+
 Smoke-test search:
 
 ```powershell
@@ -239,6 +241,23 @@ curl -X POST http://127.0.0.1:8001/api/graph-rag/preview -H "Content-Type: appli
 
 ---
 
+## 11. Agentic workflow (OCR JSON → LangChain agents)
+
+Requires the same backend deps as Graph RAG (`pip install -r backend/requirements.txt` includes **LangChain** + **langchain-ollama**).
+
+1. Configure **`GRAPH_RAG_ENABLED=1`**, **`NEO4J_PASSWORD`**, and build the **Faiss** index (`graph-db/scripts/vector_index.py build`) so Agent 1 can query the KB.
+2. In the UI, open **1b. Agentic workflow (OCR JSON)**.
+3. **Upload `ocr.json`** (Azure-style: pages with `words`, `line`, `text`, etc.) — you receive a **`job_id`** (session).
+4. Define **entities** in section 2 as usual (names required). Optionally add **Annotate** examples (landmark / label / value) for Agent 2.
+5. **Agent 1 — Discover KB**: chunks OCR lines, builds a **session FAISS** index, runs **similarity search** per entity over OCR + searches the **global KB** vector index (and Neo4j expansion when configured). Review the summary and KB matches in the UI.
+6. Adjust entities/examples, then **Agent 2 — Synthesize JSON**: uses **LangChain `ChatOllama`** to emit **`patterns` / `rules` / `templates`** arrays plus **`rationale`** (Pydantic-validated).
+
+API routes: `POST /api/agent/ocr-upload`, `POST /api/agent/discover`, `POST /api/agent/synthesize`.
+
+Optional: set **`AGENT_LLM_SUMMARY=1`** for a short Ollama summary per entity in Agent 1; **`AGENT1_MODEL`** / **`AGENT2_MODEL`** override the default Ollama model for each stage (`backend/env.example`).
+
+---
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -249,6 +268,8 @@ curl -X POST http://127.0.0.1:8001/api/graph-rag/preview -H "Content-Type: appli
 | Frontend cannot reach API | Uvicorn on 8001; `VITE_BACKEND_ORIGIN` if not using default proxy. |
 | OCR or GPU issues | `GPU_SETUP.md`, `OCR_ENGINE` in upload request / env, Docling vs EasyOCR installs. |
 | Cypher load errors | APOC plugin installed in Neo4j; JSON arrays; `spacyPattern` stored as `spacyPatternJson` in patterns (see `graph-db/cypher/02_load_patterns.cypher`). |
+| Agent 1 discover fails | `GRAPH_RAG_ENABLED` + index path; OCR JSON must parse (`normalize_azure` pages/words). |
+| Agent 2 JSON error | Ollama model returns non-JSON — try `AGENT2_MODEL=qwen2.5:7b`; shorten OCR in env (`LLM_MAX_CHARS`). |
 
 ---
 

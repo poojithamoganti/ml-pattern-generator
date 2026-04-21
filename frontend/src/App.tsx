@@ -1,18 +1,24 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
+  agentDiscover,
+  agentSynthesize,
   generateRegex,
   getGraphRagStatus,
   getOcrBoxes,
   listModels,
   ollamaHealth,
+  uploadAgentOcr,
   uploadPdf,
   validateRegex,
+  type AgentDiscoverResponse,
+  type AgentSynthesizeResponse,
   type EntitySpec,
   type OcrBox,
   type OcrBoxesResponse,
   type RegexGenerateResponse,
   type RegexPatternItem,
   type UploadResponse,
+  type ValidatedEntityOcr,
 } from './api'
 import './App.css'
 
@@ -155,6 +161,21 @@ function toSpecs(rows: EntityForm[]): EntitySpec[] {
   return out
 }
 
+/** Map merged EntitySpec rows to Agent 2 validation payload (first example per entity). */
+function specsToValidated(specs: EntitySpec[]): ValidatedEntityOcr[] {
+  return specs.map((s) => {
+    const ex = s.examples?.[0]
+    return {
+      name: s.name,
+      kind: s.kind || 'text',
+      landmark: ex?.landmark ?? '',
+      label: ex?.label ?? '',
+      value: ex?.value ?? '',
+      hints: s.hints ?? '',
+    }
+  })
+}
+
 /** Pretty-print if the model returned JSON; otherwise show verbatim. */
 function prettyModelRaw(raw: string): string {
   const t = raw.trim()
@@ -236,6 +257,9 @@ export default function App() {
   const [ollamaWarn, setOllamaWarn] = useState<string | null>(null)
   const [useGraphRag, setUseGraphRag] = useState(false)
   const [graphRagHint, setGraphRagHint] = useState<string | null>(null)
+  const [agentJobId, setAgentJobId] = useState<string | null>(null)
+  const [agentDiscoverResult, setAgentDiscoverResult] = useState<AgentDiscoverResponse | null>(null)
+  const [agentSynthResult, setAgentSynthResult] = useState<AgentSynthesizeResponse | null>(null)
 
   const loadOcrPage = useCallback(
     async (page: number, docIdOverride?: string, dpiOverride?: number) => {
@@ -621,6 +645,81 @@ export default function App() {
     }
   }
 
+  const onAgentOcrJson = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]
+    e.target.value = ''
+    if (!f) return
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Uploading ocr.json…')
+    setAgentDiscoverResult(null)
+    setAgentSynthResult(null)
+    try {
+      const r = await uploadAgentOcr(f)
+      setAgentJobId(r.job_id)
+    } catch (er: unknown) {
+      setErr(String(er))
+      setAgentJobId(null)
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
+  const runAgentDiscover = async () => {
+    if (!agentJobId) {
+      setErr('Upload ocr.json first (Agentic section).')
+      return
+    }
+    const specs = toSpecs(entities)
+    if (!specs.length) {
+      setErr('Add at least one entity with a name.')
+      return
+    }
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Agent 1: chunking, embedding, KB + OCR search…')
+    try {
+      const r = await agentDiscover({ job_id: agentJobId, entities: specs })
+      setAgentDiscoverResult(r)
+      setAgentSynthResult(null)
+    } catch (er: unknown) {
+      setErr(String(er))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
+  const runAgentSynthesize = async () => {
+    if (!agentJobId) {
+      setErr('Missing agent job — upload ocr.json again.')
+      return
+    }
+    const specs = toSpecs(entities)
+    const validated = specsToValidated(specs)
+    if (!validated.length) {
+      setErr('Add entities and optional landmark/label/value examples for Agent 2.')
+      return
+    }
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Agent 2: synthesizing patterns / rules / templates JSON…')
+    try {
+      const r = await agentSynthesize({
+        job_id: agentJobId,
+        validated,
+        model: model || null,
+      })
+      setAgentSynthResult(r)
+    } catch (er: unknown) {
+      setErr(String(er))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
   const copyPattern = async (entity: string, text: string) => {
     try {
       await navigator.clipboard.writeText(text)
@@ -934,6 +1033,76 @@ export default function App() {
               </div>
             )}
           </div>
+        )}
+      </section>
+
+      <section className="card agentic-card">
+        <h2>1b. Agentic workflow (OCR JSON)</h2>
+        <p className="section-lead muted small">
+          Upload precomputed <strong>ocr.json</strong> (e.g. Azure layout). Agent 1 chunks text, embeds into a session
+          vector index, and searches Neo4j/Faiss for existing patterns/rules/templates. Refine entities & examples below,
+          then Agent 2 emits structured JSON artifacts.
+        </p>
+        <div className="agentic-toolbar">
+          <label className="file file-secondary">
+            <input type="file" accept="application/json,.json" onChange={onAgentOcrJson} disabled={busy} />
+            <span>{agentJobId ? `Job: ${agentJobId.slice(0, 8)}…` : 'Upload ocr.json'}</span>
+          </label>
+          <button type="button" className="btn secondary" onClick={runAgentDiscover} disabled={busy || !agentJobId}>
+            Agent 1 — Discover KB
+          </button>
+          <button type="button" className="btn secondary" onClick={runAgentSynthesize} disabled={busy || !agentJobId}>
+            Agent 2 — Synthesize JSON
+          </button>
+        </div>
+        {agentDiscoverResult && (
+          <details className="agent-discover" open>
+            <summary>
+              Discovery ({agentDiscoverResult.ocr_chunks_indexed} lines indexed
+              {agentDiscoverResult.graph_rag_error ? ` · KB note: ${agentDiscoverResult.graph_rag_error}` : ''})
+            </summary>
+            <ul className="agent-entity-list">
+              {agentDiscoverResult.entities.map((ent) => (
+                <li key={ent.entity_name}>
+                  <strong>{ent.entity_name}</strong> ({ent.kind})
+                  <p className="brief-summary">{ent.brief_summary}</p>
+                  {ent.kb_matches.length > 0 && (
+                    <div className="kb-matches">
+                      <span className="muted">KB matches:</span>
+                      <ul>
+                        {ent.kb_matches.slice(0, 8).map((m) => (
+                          <li key={`${m.kind}-${m.primary_id}`}>
+                            <code>{m.kind}</code> {m.primary_id} (score {Number(m.score).toFixed(3)}) — {m.title}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {ent.ocr_chunk_hits.length > 0 && (
+                    <div className="ocr-chunk-hits">
+                      <span className="muted">OCR lines:</span>
+                      <ul>
+                        {ent.ocr_chunk_hits.map((h) => (
+                          <li key={h.chunk_id}>
+                            p{h.page} · {h.text_excerpt.slice(0, 120)}
+                            {h.text_excerpt.length > 120 ? '…' : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+        {agentSynthResult && (
+          <details className="agent-synth" open>
+            <summary>
+              Agent 2 output ({agentSynthResult.ollama_model})
+            </summary>
+            <pre className="agent-json-out">{JSON.stringify(agentSynthResult.artifacts, null, 2)}</pre>
+          </details>
         )}
       </section>
 

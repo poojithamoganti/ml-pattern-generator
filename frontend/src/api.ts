@@ -181,10 +181,113 @@ export type GraphRagStatus = {
   index_ready: boolean
   neo4j_configured: boolean
   neo4j_uri: string
+  hybrid_enabled?: boolean
+  hybrid_rrf_k?: number
+  hybrid_dense_branch_k?: number
+  hybrid_bm25_branch_k?: number
+  doc_snippet_chars?: number
 }
 
 export async function getGraphRagStatus(): Promise<GraphRagStatus> {
   return fetchJson(`${BASE}/api/graph-rag/status`, { method: 'GET', headers: {} })
+}
+
+// --- Agentic workflow (OCR JSON → discover → synthesize) ---
+
+export type AgentOcrUploadResponse = {
+  job_id: string
+  source_name: string
+  page_count: number
+  line_count: number
+  char_count: number
+  text_preview: string
+}
+
+export type KbMatchBrief = {
+  kind: string
+  primary_id: string
+  score: number
+  title: string
+  summary: string
+}
+
+export type OcrChunkHit = {
+  chunk_id: string
+  page: number
+  text_excerpt: string
+  relevance_note: string
+}
+
+export type EntityDiscoveryResult = {
+  entity_name: string
+  kind: string
+  kb_matches: KbMatchBrief[]
+  ocr_chunk_hits: OcrChunkHit[]
+  brief_summary: string
+}
+
+export type AgentDiscoverResponse = {
+  job_id: string
+  ocr_chunks_indexed: number
+  entities: EntityDiscoveryResult[]
+  graph_rag_error: string
+  notes: string
+}
+
+export type ValidatedEntityOcr = {
+  name: string
+  kind: string
+  landmark: string
+  label: string
+  value: string
+  hints: string
+}
+
+export type AgentArtifactEnvelope = {
+  patterns: Record<string, unknown>[]
+  rules: Record<string, unknown>[]
+  templates: Record<string, unknown>[]
+  rationale: string
+}
+
+export type AgentSynthesizeResponse = {
+  job_id: string
+  artifacts: AgentArtifactEnvelope
+  raw_model_text: string
+  ollama_model: string
+  error: string
+}
+
+export async function uploadAgentOcr(file: File): Promise<AgentOcrUploadResponse> {
+  const fd = new FormData()
+  fd.append('file', file)
+  return fetchJson(`${BASE}/api/agent/ocr-upload`, { method: 'POST', body: fd })
+}
+
+export async function agentDiscover(body: {
+  job_id: string
+  entities: EntitySpec[]
+  kb_vector_k?: number
+  ocr_chunk_k?: number
+}): Promise<AgentDiscoverResponse> {
+  return fetchJson(`${BASE}/api/agent/discover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export async function agentSynthesize(body: {
+  job_id: string
+  validated: ValidatedEntityOcr[]
+  model?: string | null
+  extra_instructions?: string
+}): Promise<AgentSynthesizeResponse> {
+  return fetchJson(`${BASE}/api/agent/synthesize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 }
 
 export async function listModels(): Promise<{ models: string[]; error?: string }> {

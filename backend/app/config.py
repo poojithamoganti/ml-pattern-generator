@@ -52,6 +52,19 @@ GRAPH_RAG_ENABLED = os.getenv("GRAPH_RAG_ENABLED", "0").lower() in ("1", "true",
 GRAPH_RAG_INDEX_DIR = Path(os.getenv("GRAPH_RAG_INDEX_DIR", str(_DEFAULT_GRAPH_RAG_INDEX)))
 GRAPH_RAG_VECTOR_K = int(os.getenv("GRAPH_RAG_VECTOR_K", "12"))
 GRAPH_RAG_MAX_CONTEXT_CHARS = int(os.getenv("GRAPH_RAG_MAX_CONTEXT_CHARS", "20000"))
+# Hybrid Graph RAG: BM25 (lexical) + 2× dense (entity-focused vs full) fused by RRF — improves recall vs pure cosine.
+GRAPH_RAG_HYBRID = os.getenv("GRAPH_RAG_HYBRID", "1").lower() in ("1", "true", "yes")
+GRAPH_RAG_RRF_K = int(os.getenv("GRAPH_RAG_RRF_K", "60"))
+GRAPH_RAG_DENSE_BRANCH_K = int(os.getenv("GRAPH_RAG_DENSE_BRANCH_K", "48"))
+GRAPH_RAG_BM25_BRANCH_K = int(os.getenv("GRAPH_RAG_BM25_BRANCH_K", "48"))
+GRAPH_RAG_DOC_SNIPPET_CHARS = int(os.getenv("GRAPH_RAG_DOC_SNIPPET_CHARS", "1200"))
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687").rstrip("/")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "").strip()
+
+# --- Agentic workflow (LangChain + multi-step agents) ---
+AGENT1_MODEL = os.getenv("AGENT1_MODEL", "").strip() or None  # defaults to OLLAMA_MODEL
+AGENT2_MODEL = os.getenv("AGENT2_MODEL", "").strip() or None
+AGENT_OCR_CHUNK_K = int(os.getenv("AGENT_OCR_CHUNK_K", "6"))
+# If 1, Agent 1 uses a short Ollama call per entity for brief_summary; else heuristic text only
+AGENT_LLM_SUMMARY = os.getenv("AGENT_LLM_SUMMARY", "0").lower() in ("1", "true", "yes")
