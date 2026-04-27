@@ -1,5 +1,14 @@
 """
-Regex Pattern Lab — FastAPI backend: PDF text + Ollama-powered regex generation.
+Pattern Rule Gen — FastAPI backend.
+
+Ingest:  POST /api/ingest/pdf      – upload PDF (stored for page rendering)
+         POST /api/ingest/ocr      – upload Azure OCR JSON (text + bboxes)
+Render:  GET  /api/ingest/page     – render PDF page to base64 PNG (pypdfium2)
+Agents:  POST /api/agent/discover  – Agent 1: KB + OCR gap discovery
+         POST /api/agent/synthesize – Agent 2: KB-schema artifact synthesis
+Graph:   GET  /api/graph-rag/status
+         POST /api/graph-rag/preview
+Utility: GET  /api/models
 """
 
 from __future__ import annotations
@@ -7,16 +16,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-import uuid
 from typing import Annotated
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import (
-    EXTRACTION_MODE,
     GRAPH_RAG_BM25_BRANCH_K,
     GRAPH_RAG_DENSE_BRANCH_K,
     GRAPH_RAG_DOC_SNIPPET_CHARS,
@@ -30,121 +36,46 @@ from app.config import (
     NEO4J_PASSWORD,
     NEO4J_URI,
     NEO4J_USER,
-    OCR_DPI,
-    OCR_ENGINE,
-    OCR_USE_GPU,
     OLLAMA_BASE_URL,
-    OLLAMA_REFINEMENT_MODEL,
-    UPLOAD_DIR,
 )
 from app.schemas import (
     GraphRagPreviewRequest,
     GraphRagPreviewResponse,
-    RegexBatchRequest,
-    RegexBatchResponse,
-    RegexGenerateRequest,
-    RegexGenerateResponse,
-    OcrBoxesResponse,
-    RegexValidateRequest,
-    RegexValidateResponse,
-    UploadResponse,
 )
 from app.schemas_agents import (
     AgentDiscoverRequest,
     AgentDiscoverResponse,
     AgentOcrUploadResponse,
+    AgentPageImageResponse,
+    AgentPreviewRequest,
+    AgentPreviewResponse,
     AgentSynthesizeRequest,
     AgentSynthesizeResponse,
+    PdfUploadResponse,
 )
-from app.services.agent_session_store import create_job
+from app.services.agent_session_store import create_job, get_job
 from app.services.agents.agent1_discover import run_agent1_discover
 from app.services.agents.agent2_synthesize import run_agent2_synthesize
+from app.services.agents.agent3_preview import run_agent3_preview
 from app.services.ocr_json_parser import normalize_ocr_json
-from app.services.graph_rag import build_retrieval_query, run_graph_rag_safe
-from app.services.llm_regex import generate_regex_patterns, refine_regex_patterns_with_llm
-from app.services.pdf_extract import extract_document, save_upload
-from app.services.ocr_boxes import ocr_boxes_for_upload
+from app.services.graph_rag import run_graph_rag_safe
+from app.services.pdf_to_images import get_page_count, render_page
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _model_error_detail(exc: BaseException) -> str:
-    """
-    Build a non-empty message for API responses.
-    HTTPException.__str__ can be '' when detail is empty; never return blank.
-    """
-    import traceback
-
-    if isinstance(exc, HTTPException):
-        d = exc.detail
-        if isinstance(d, str) and d.strip():
-            return d.strip()
-        if d is not None and not isinstance(d, str):
-            return str(d)
-        return f"HTTPException status={exc.status_code} detail={d!r}"
-
-    one = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-    if one:
-        return one
-    return f"{type(exc).__name__}: (no message; see server logs)"
+def _raise_agent_error(exc: BaseException, label: str = "Agent") -> None:
+    logger.exception("%s failed", label)
+    msg = str(exc).strip() or f"{type(exc).__name__}: (no message; see server logs)"
+    raise HTTPException(status_code=500, detail=f"{label} error: {msg}") from exc
 
 
-def _strip_invisible(s: str) -> str:
-    """Remove ZWSP/BOM so we never build a detail that looks empty on screen."""
-    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        s = s.replace(ch, "")
-    return s.strip()
-
-
-def _graph_rag_context_for_request(
-    body: RegexGenerateRequest,
-) -> tuple[str | None, list[dict], str]:
-    """Build KB context string for the LLM; returns (context, hits, error)."""
-    if not body.use_graph_rag or not GRAPH_RAG_ENABLED:
-        return None, [], ""
-    names = [e.name for e in body.entities if e.name.strip()]
-    hints = "\n".join((e.hints or "") for e in body.entities)
-    snippet = (body.full_text or "")[:3000]
-    rq = build_retrieval_query(names, hints, snippet)
-    return run_graph_rag_safe(
-        index_dir=GRAPH_RAG_INDEX_DIR,
-        neo4j_uri=NEO4J_URI,
-        neo4j_user=NEO4J_USER,
-        neo4j_password=NEO4J_PASSWORD,
-        retrieval_query=rq,
-        vector_k=GRAPH_RAG_VECTOR_K,
-        max_context_chars=GRAPH_RAG_MAX_CONTEXT_CHARS,
-    )
-
-
-def _raise_model_error(exc: BaseException) -> None:
-    logger.exception("LLM call failed")
-    base = _strip_invisible(_model_error_detail(exc) or "")
-    alt = _strip_invisible(str(exc))
-    parts: list[str] = []
-    if base:
-        parts.append(base)
-    if alt and alt != base and alt not in base:
-        parts.append(alt)
-    args = getattr(exc, "args", ())
-    if args and str(args) not in "".join(parts):
-        parts.append(f"args={args!r}")
-    core = " | ".join(parts) if parts else f"{exc.__class__.__qualname__}: {exc!r}"
-    core = _strip_invisible(core)
-    if not core:
-        core = f"{exc.__class__.__qualname__}: {exc!r}"
-    if not _strip_invisible(core):
-        core = f"{type(exc).__name__} (no message; check server logs)"
-    msg = f"Model error: {core}"
-    # Final guard: colon with nothing visible (e.g. only whitespace / odd Unicode)
-    tail = msg.split(":", 1)[-1] if ":" in msg else msg
-    if not _strip_invisible(tail):
-        msg = f"Model error: {type(exc).__name__}: {exc!r}"
-    raise HTTPException(status_code=502, detail=msg) from exc
-
-
-app = FastAPI(title="Regex Pattern Lab", version="0.2.0", description="PDF/OCR regex + agentic KB discovery")
+app = FastAPI(
+    title="Pattern Rule Gen",
+    version="0.3.0",
+    description="PDF + Azure OCR JSON ingest → agentic KB gap analysis → pattern/rule/template synthesis",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -155,16 +86,67 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/api/agent/ocr-upload", response_model=AgentOcrUploadResponse)
-async def agent_ocr_upload(file: Annotated[UploadFile, File()]):
-    """Upload Azure-style ocr.json; returns job_id for Agent 1 / Agent 2."""
+# ---------------------------------------------------------------------------
+# Step 1 — Ingest
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/ingest/pdf", response_model=PdfUploadResponse)
+async def ingest_pdf(file: Annotated[UploadFile, File()]):
+    """
+    Upload the source PDF.  No OCR is run here — the PDF is stored in the
+    session so that individual pages can be rendered on demand via
+    GET /api/ingest/page.
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Please upload a .pdf file.")
+
+    raw = await file.read()
+    max_b = MAX_UPLOAD_MB * 1024 * 1024
+    if len(raw) > max_b:
+        raise HTTPException(400, f"File too large (max {MAX_UPLOAD_MB} MB).")
+
+    try:
+        page_count = await asyncio.to_thread(get_page_count, raw)
+    except Exception as e:
+        raise HTTPException(400, f"Could not read PDF: {e}") from e
+
+    # Create a job with no OCR yet; OCR will be attached when /api/ingest/ocr is called.
+    from app.services.ocr_json_parser import NormalizedOcr, OcrLine
+    placeholder_ocr = NormalizedOcr(lines=[], full_text="", page_count=page_count)
+    jid = create_job(
+        ocr=placeholder_ocr,
+        source_name=file.filename,
+        pdf_bytes=raw,
+        pdf_page_count=page_count,
+    )
+    return PdfUploadResponse(job_id=jid, filename=file.filename, page_count=page_count)
+
+
+@app.post("/api/ingest/ocr", response_model=AgentOcrUploadResponse)
+async def ingest_ocr(
+    file: Annotated[UploadFile, File()],
+    job_id: str | None = None,
+):
+    """
+    Upload the Azure OCR JSON for a document.
+
+    If `job_id` is provided (from a prior /api/ingest/pdf call) the OCR data
+    is attached to that session so both PDF images and OCR text are available.
+    If omitted, a new session is created (PDF rendering will not be available).
+    """
     if not file.filename or not file.filename.lower().endswith(".json"):
-        raise HTTPException(400, "Please upload a .json file (e.g. Azure OCR export).")
+        raise HTTPException(400, "Please upload a .json file (Azure OCR export).")
 
     raw = await file.read()
     max_b = MAX_UPLOAD_MB * 1024 * 1024
@@ -181,23 +163,76 @@ async def agent_ocr_upload(file: Annotated[UploadFile, File()]):
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
-    jid = create_job(ocr, file.filename or "ocr.json")
-    prev = ocr.full_text[:4000] + ("..." if len(ocr.full_text) > 4000 else "")
+    if job_id:
+        # Attach OCR to the existing PDF session
+        job = get_job(job_id)
+        if job is None:
+            raise HTTPException(404, f"Session '{job_id}' not found. Upload the PDF again.")
+        from app.services import agent_session_store as _store
+        import threading
+        with _store._lock:
+            _store._jobs[job_id]["ocr"] = ocr
+            _store._jobs[job_id]["source_name"] = file.filename or "ocr.json"
+        jid = job_id
+    else:
+        jid = create_job(ocr, source_name=file.filename or "ocr.json")
+
+    preview = ocr.full_text[:4000] + ("..." if len(ocr.full_text) > 4000 else "")
     return AgentOcrUploadResponse(
         job_id=jid,
         source_name=file.filename or "ocr.json",
         page_count=ocr.page_count,
         line_count=len(ocr.lines),
         char_count=len(ocr.full_text),
-        text_preview=prev,
+        text_preview=preview,
     )
+
+
+@app.get("/api/ingest/page", response_model=AgentPageImageResponse)
+async def ingest_page(
+    job_id: str = Query(..., description="Session job_id from /api/ingest/pdf"),
+    page: int = Query(default=1, ge=1, description="1-indexed page number"),
+    dpi: int = Query(default=150, ge=72, le=300, description="Render resolution"),
+):
+    """
+    Render a single PDF page to a base64 PNG using pypdfium2.
+    The PDF must have been uploaded first via POST /api/ingest/pdf.
+    """
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"Session '{job_id}' not found.")
+
+    pdf_bytes: bytes | None = job.get("pdf_bytes")
+    if not pdf_bytes:
+        raise HTTPException(400, "No PDF in this session. Upload the PDF via POST /api/ingest/pdf first.")
+
+    try:
+        image_b64, w, h = await asyncio.to_thread(render_page, pdf_bytes, page, dpi)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.exception("Page render failed")
+        raise HTTPException(500, f"Page render failed: {e}") from e
+
+    total = job.get("pdf_page_count") or job["ocr"].page_count or 1
+    return AgentPageImageResponse(
+        job_id=job_id,
+        page_num=page,
+        total_pages=total,
+        image_b64=image_b64,
+        width_px=w,
+        height_px=h,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
 
 
 @app.post("/api/agent/discover", response_model=AgentDiscoverResponse)
 async def agent_discover(body: AgentDiscoverRequest):
-    """
-    Agent 1: chunk/embed OCR lines → session FAISS; per entity search KB (graph vector index) + OCR similarity.
-    """
+    """Agent 1: embed OCR lines → session FAISS; per-entity KB (hybrid) + OCR similarity search."""
     try:
         payload = await asyncio.to_thread(
             run_agent1_discover,
@@ -210,13 +245,24 @@ async def agent_discover(body: AgentDiscoverRequest):
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except Exception as e:
-        logger.exception("Agent 1 discover failed")
-        raise HTTPException(500, str(e)) from e
+        _raise_agent_error(e, "Agent 1 discover")
+
+
+@app.post("/api/agent/preview-extraction", response_model=AgentPreviewResponse)
+async def agent_preview_extraction(body: AgentPreviewRequest):
+    """Agent 3: apply synthesized regex/string patterns against OCR lines to verify extraction."""
+    try:
+        result = await asyncio.to_thread(run_agent3_preview, body.job_id, body.artifacts)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        _raise_agent_error(e, "Agent 3 preview-extraction")
 
 
 @app.post("/api/agent/synthesize", response_model=AgentSynthesizeResponse)
 async def agent_synthesize(body: AgentSynthesizeRequest):
-    """Agent 2: validated annotations → structured patterns / rules / templates JSON."""
+    """Agent 2: validated annotations + KB gap context → KB-schema patterns/rules/templates."""
     try:
         env, raw, model_used = await asyncio.to_thread(
             run_agent2_synthesize,
@@ -235,13 +281,16 @@ async def agent_synthesize(body: AgentSynthesizeRequest):
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except Exception as e:
-        logger.exception("Agent 2 synthesize failed")
-        _raise_model_error(e)
+        _raise_agent_error(e, "Agent 2 synthesize")
+
+
+# ---------------------------------------------------------------------------
+# Graph RAG utilities
+# ---------------------------------------------------------------------------
 
 
 @app.get("/api/graph-rag/status")
 def graph_rag_status():
-    """Whether Graph RAG is configured and the vector index directory exists."""
     idx = GRAPH_RAG_INDEX_DIR
     has_cfg = (idx / "config.json").is_file() and (idx / "vectors.faiss").is_file()
     return {
@@ -277,6 +326,11 @@ def graph_rag_preview(body: GraphRagPreviewRequest):
     return GraphRagPreviewResponse(context=ctx, hits=hits, error="")
 
 
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+
 @app.get("/api/models")
 async def list_ollama_models():
     """List models available in local Ollama (for UI dropdown)."""
@@ -290,237 +344,3 @@ async def list_ollama_models():
     except Exception as e:
         logger.warning("Could not list Ollama models: %s", e)
         return {"models": [], "error": str(e)}
-
-
-@app.post("/api/upload", response_model=UploadResponse)
-async def upload_pdf(
-    file: Annotated[UploadFile, File()],
-    extraction_mode: Annotated[str | None, Form()] = None,
-    ocr_engine: Annotated[str | None, Form()] = None,
-    ocr_dpi: Annotated[int | None, Form()] = None,
-):
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Please upload a PDF file.")
-
-    raw = await file.read()
-    max_b = MAX_UPLOAD_MB * 1024 * 1024
-    if len(raw) > max_b:
-        raise HTTPException(400, f"File too large (max {MAX_UPLOAD_MB} MB).")
-
-    uid = str(uuid.uuid4())
-    path = UPLOAD_DIR / f"{uid}_{file.filename}"
-    save_upload(path, raw)
-
-    mode = (extraction_mode or EXTRACTION_MODE or "scan").lower()
-    if mode not in ("scan", "auto", "embedded"):
-        raise HTTPException(400, "extraction_mode must be scan, auto, or embedded.")
-    engine = (ocr_engine or OCR_ENGINE or "docling").lower()
-    if engine not in ("paddle", "easyocr", "docling"):
-        raise HTTPException(400, "ocr_engine must be paddle, easyocr, or docling.")
-    dpi = int(ocr_dpi) if ocr_dpi is not None else OCR_DPI
-    if dpi < 72 or dpi > 600:
-        raise HTTPException(400, "ocr_dpi must be between 72 and 600.")
-
-    try:
-        text, pages, method = extract_document(
-            raw,
-            mode=mode,
-            ocr_engine=engine,
-            use_gpu=OCR_USE_GPU,
-            ocr_dpi=dpi,
-        )
-    except Exception as e:
-        logger.exception("Extract failed")
-        raise HTTPException(500, f"PDF extraction failed: {e}") from e
-
-    preview = text[:4000] + ("..." if len(text) > 4000 else "")
-    return UploadResponse(
-        upload_id=uid,
-        filename=file.filename,
-        pages=pages,
-        text_preview=preview,
-        full_text=text,
-        extraction_method=method,
-        extraction_mode=mode,
-        ocr_engine=engine,
-        ocr_dpi=dpi,
-    )
-
-
-@app.get("/api/ocr-boxes", response_model=OcrBoxesResponse)
-async def get_ocr_boxes(
-    upload_id: str,
-    page: int = 1,
-    dpi: int = 200,
-):
-    """
-    Return a rendered page image + OCR token boxes (EasyOCR) for annotation UI.
-    Page is 1-indexed.
-    """
-    if page < 1:
-        raise HTTPException(400, "page must be >= 1")
-    if dpi < 72 or dpi > 600:
-        raise HTTPException(400, "dpi must be between 72 and 600.")
-    try:
-        return await ocr_boxes_for_upload(upload_id=upload_id, page=page, dpi=dpi)
-    except FileNotFoundError:
-        raise HTTPException(404, "Upload not found. Upload the PDF again.") from None
-    except Exception as e:
-        logger.exception("OCR boxes failed")
-        raise HTTPException(500, f"OCR boxes failed: {e}") from e
-
-
-@app.post("/api/generate-regex-batch", response_model=RegexBatchResponse)
-async def generate_regex_batch(body: RegexBatchRequest):
-    """Run the same prompt against several Ollama models (compare generalization ideas)."""
-
-    kb: str | None = None
-    g_err = ""
-    g_hits: list[dict] = []
-    if body.use_graph_rag and GRAPH_RAG_ENABLED:
-        rq = build_retrieval_query(
-            [e.name for e in body.entities],
-            "\n".join((e.hints or "") for e in body.entities),
-            (body.full_text or "")[:3000],
-        )
-        kb, g_hits, g_err = await asyncio.to_thread(
-            lambda: run_graph_rag_safe(
-                index_dir=GRAPH_RAG_INDEX_DIR,
-                neo4j_uri=NEO4J_URI,
-                neo4j_user=NEO4J_USER,
-                neo4j_password=NEO4J_PASSWORD,
-                retrieval_query=rq,
-                vector_k=GRAPH_RAG_VECTOR_K,
-                max_context_chars=GRAPH_RAG_MAX_CONTEXT_CHARS,
-            )
-        )
-
-    async def one(m: str) -> RegexGenerateResponse:
-        gen = await generate_regex_patterns(
-            body.full_text,
-            body.entities,
-            m,
-            body.extra_instructions,
-            [],
-            kb_context=kb,
-        )
-        return gen.model_copy(
-            update={
-                "graph_rag_used": bool(body.use_graph_rag and GRAPH_RAG_ENABLED),
-                "graph_rag_error": g_err if body.use_graph_rag else "",
-                "graph_rag_hits": g_hits if body.use_graph_rag else [],
-            }
-        )
-
-    try:
-        results = await asyncio.gather(*[one(m) for m in body.models])
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Batch LLM failed")
-        _raise_model_error(e)
-    return RegexBatchResponse(results=list(results))
-
-
-@app.post("/api/generate-regex", response_model=RegexGenerateResponse)
-async def generate_regex(body: RegexGenerateRequest):
-    if not body.entities:
-        raise HTTPException(400, "At least one entity is required.")
-    kb_ctx: str | None = None
-    g_hits: list[dict] = []
-    g_err = ""
-    if body.use_graph_rag and GRAPH_RAG_ENABLED:
-        kb_ctx, g_hits, g_err = await asyncio.to_thread(_graph_rag_context_for_request, body)
-    try:
-        gen = await generate_regex_patterns(
-            body.full_text,
-            body.entities,
-            body.model,
-            body.extra_instructions,
-            body.additional_full_texts,
-            kb_context=kb_ctx,
-        )
-        gen = gen.model_copy(
-            update={
-                "graph_rag_used": bool(body.use_graph_rag and GRAPH_RAG_ENABLED),
-                "graph_rag_error": g_err if body.use_graph_rag else "",
-                "graph_rag_hits": g_hits if body.use_graph_rag else [],
-            }
-        )
-        ref_model = (body.refinement_model or "").strip() or OLLAMA_REFINEMENT_MODEL
-        if ref_model:
-            try:
-                gen = await refine_regex_patterns_with_llm(
-                    body.full_text,
-                    body.entities,
-                    gen,
-                    ref_model,
-                )
-            except Exception as e:
-                logger.warning("Regex refinement pass failed; returning first-pass patterns only: %s", e)
-        return gen
-    except HTTPException:
-        raise
-    except Exception as e:
-        _raise_model_error(e)
-
-
-@app.post("/api/test-regex")
-async def test_regex(body: RegexGenerateRequest):
-    """Generate patterns and return first match per entity on the provided text."""
-    gen = await generate_regex(body)
-    results: dict[str, list[str]] = {}
-    flags_map = {
-        "IGNORECASE": re.IGNORECASE,
-        "DOTALL": re.DOTALL,
-        "MULTILINE": re.MULTILINE,
-    }
-
-    for p in gen.patterns:
-        if not p.pattern.strip():
-            results[p.entity] = []
-            continue
-        fl = 0
-        for part in re.split(r"[|,]", p.flags):
-            part = part.strip()
-            if part in flags_map:
-                fl |= flags_map[part]
-        try:
-            m = re.findall(p.pattern, body.full_text, fl)
-            if m and isinstance(m[0], tuple):
-                m = [x for t in m for x in t if x]
-            results[p.entity] = m[:20] if isinstance(m, list) else [str(m)][:20]
-        except re.error as e:
-            results[p.entity] = [f"<regex error: {e}>"]
-
-    return {"generation": gen.model_dump(), "matches": results}
-
-
-@app.post("/api/validate-regex", response_model=RegexValidateResponse)
-async def validate_regex(body: RegexValidateRequest):
-    """Run provided patterns against provided text and return matches/errors per entity."""
-    results: dict[str, list[str]] = {}
-    errors: dict[str, str] = {}
-    flags_map = {
-        "IGNORECASE": re.IGNORECASE,
-        "DOTALL": re.DOTALL,
-        "MULTILINE": re.MULTILINE,
-    }
-    for p in body.patterns:
-        if not p.pattern.strip():
-            results[p.entity] = []
-            continue
-        fl = 0
-        for part in re.split(r"[|,]", (p.flags or "")):
-            part = part.strip()
-            if part in flags_map:
-                fl |= flags_map[part]
-        try:
-            m = re.findall(p.pattern, body.full_text, fl)
-            if m and isinstance(m[0], tuple):
-                m = [x for t in m for x in t if x]
-            results[p.entity] = m[:50] if isinstance(m, list) else [str(m)][:50]
-        except re.error as e:
-            results[p.entity] = []
-            errors[p.entity] = str(e)
-    return RegexValidateResponse(matches=results, errors=errors)

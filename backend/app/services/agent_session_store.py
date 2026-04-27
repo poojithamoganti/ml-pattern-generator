@@ -29,7 +29,12 @@ def _prune() -> None:
             _jobs.pop(k, None)
 
 
-def create_job(ocr: NormalizedOcr, source_name: str = "ocr.json") -> str:
+def create_job(
+    ocr: NormalizedOcr,
+    source_name: str = "ocr.json",
+    pdf_bytes: bytes | None = None,
+    pdf_page_count: int = 0,
+) -> str:
     jid = str(uuid.uuid4())
     with _lock:
         _prune()
@@ -37,6 +42,9 @@ def create_job(ocr: NormalizedOcr, source_name: str = "ocr.json") -> str:
             "_ts": time.time(),
             "ocr": ocr,
             "source_name": source_name,
+            # Raw PDF bytes for page-image rendering (may be None if not uploaded)
+            "pdf_bytes": pdf_bytes,
+            "pdf_page_count": pdf_page_count,
             "vectorstore": None,
             "last_discover": None,
         }

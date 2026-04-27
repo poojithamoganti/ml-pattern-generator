@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   agentDiscover,
+  agentPreviewExtraction,
   agentSynthesize,
   generateRegex,
   getGraphRagStatus,
@@ -11,7 +12,9 @@ import {
   uploadPdf,
   validateRegex,
   type AgentDiscoverResponse,
+  type AgentPreviewResponse,
   type AgentSynthesizeResponse,
+  type EntityExtractionResult,
   type EntitySpec,
   type OcrBox,
   type OcrBoxesResponse,
@@ -260,6 +263,7 @@ export default function App() {
   const [agentJobId, setAgentJobId] = useState<string | null>(null)
   const [agentDiscoverResult, setAgentDiscoverResult] = useState<AgentDiscoverResponse | null>(null)
   const [agentSynthResult, setAgentSynthResult] = useState<AgentSynthesizeResponse | null>(null)
+  const [agentPreviewResult, setAgentPreviewResult] = useState<AgentPreviewResponse | null>(null)
 
   const loadOcrPage = useCallback(
     async (page: number, docIdOverride?: string, dpiOverride?: number) => {
@@ -654,6 +658,7 @@ export default function App() {
     setBusyHint('Uploading ocr.json…')
     setAgentDiscoverResult(null)
     setAgentSynthResult(null)
+    setAgentPreviewResult(null)
     try {
       const r = await uploadAgentOcr(f)
       setAgentJobId(r.job_id)
@@ -683,6 +688,7 @@ export default function App() {
       const r = await agentDiscover({ job_id: agentJobId, entities: specs })
       setAgentDiscoverResult(r)
       setAgentSynthResult(null)
+      setAgentPreviewResult(null)
     } catch (er: unknown) {
       setErr(String(er))
     } finally {
@@ -705,6 +711,7 @@ export default function App() {
     setErr(null)
     setBusy(true)
     setBusyHint('Agent 2: synthesizing patterns / rules / templates JSON…')
+    setAgentPreviewResult(null)
     try {
       const r = await agentSynthesize({
         job_id: agentJobId,
@@ -718,6 +725,43 @@ export default function App() {
       setBusy(false)
       setBusyHint('')
     }
+  }
+
+  const runAgentPreview = async () => {
+    if (!agentJobId || !agentSynthResult) {
+      setErr('Run Agent 2 synthesis first.')
+      return
+    }
+    setErr(null)
+    setBusy(true)
+    setBusyHint('Agent 3: applying patterns to OCR text…')
+    try {
+      const r = await agentPreviewExtraction({
+        job_id: agentJobId,
+        artifacts: agentSynthResult.artifacts,
+      })
+      setAgentPreviewResult(r)
+    } catch (er: unknown) {
+      setErr(String(er))
+    } finally {
+      setBusy(false)
+      setBusyHint('')
+    }
+  }
+
+  const downloadAgentArtifacts = () => {
+    if (!agentSynthResult) return
+    const payload = {
+      generated_at: new Date().toISOString(),
+      ollama_model: agentSynthResult.ollama_model,
+      ...agentSynthResult.artifacts,
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = 'kb-artifacts.json'
+    a.click()
+    URL.revokeObjectURL(a.href)
   }
 
   const copyPattern = async (entity: string, text: string) => {
@@ -1054,6 +1098,15 @@ export default function App() {
           <button type="button" className="btn secondary" onClick={runAgentSynthesize} disabled={busy || !agentJobId}>
             Agent 2 — Synthesize JSON
           </button>
+          <button
+            type="button"
+            className="btn secondary"
+            onClick={runAgentPreview}
+            disabled={busy || !agentSynthResult}
+            title="Apply synthesized patterns to the uploaded OCR to verify extraction"
+          >
+            Agent 3 — Preview Extraction
+          </button>
         </div>
         {agentDiscoverResult && (
           <details className="agent-discover" open>
@@ -1103,6 +1156,55 @@ export default function App() {
             </summary>
             <pre className="agent-json-out">{JSON.stringify(agentSynthResult.artifacts, null, 2)}</pre>
           </details>
+        )}
+        {agentPreviewResult && (
+          <div className="agent-preview">
+            <div className="agent-preview-header">
+              <h3>
+                Extraction preview — {agentPreviewResult.total_hits} hit(s) across{' '}
+                {agentPreviewResult.results.length} entity/entities
+                {agentPreviewResult.error ? ` · Error: ${agentPreviewResult.error}` : ''}
+              </h3>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={downloadAgentArtifacts}
+                disabled={!agentSynthResult}
+                title="Download the confirmed KB artifact JSON"
+              >
+                Confirm & Export JSON
+              </button>
+            </div>
+            <ul className="agent-entity-list">
+              {agentPreviewResult.results.map((er: EntityExtractionResult) => (
+                <li key={er.entity_id} className={er.matched ? 'preview-matched' : 'preview-unmatched'}>
+                  <strong>{er.entity_name || er.entity_id}</strong>
+                  {er.matched ? (
+                    <span className="preview-badge preview-badge-ok"> {er.hits.length} match(es)</span>
+                  ) : (
+                    <span className="preview-badge preview-badge-miss"> no matches</span>
+                  )}
+                  {er.no_pattern_reason && (
+                    <p className="muted small">{er.no_pattern_reason}</p>
+                  )}
+                  {er.hits.length > 0 && (
+                    <ul className="preview-hits">
+                      {er.hits.slice(0, 8).map((h, i) => (
+                        <li key={`${h.pattern_id}-${i}`}>
+                          <code className="preview-match">{h.matched_text}</code>
+                          <span className="muted"> p{h.page} · {h.pattern_type} · pattern: {h.pattern_id}</span>
+                          <div className="preview-line-ctx">{h.line_text.slice(0, 160)}</div>
+                        </li>
+                      ))}
+                      {er.hits.length > 8 && (
+                        <li className="muted small">…and {er.hits.length - 8} more</li>
+                      )}
+                    </ul>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
       </section>
 

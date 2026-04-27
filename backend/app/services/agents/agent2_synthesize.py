@@ -1,6 +1,7 @@
 """
-Agent 2: validated entity annotations + OCR context → new patterns / rules / templates as structured JSON.
-Uses LangChain ChatOllama; parses JSON into AgentArtifactEnvelope.
+Agent 2: validated entity annotations + OCR context → KB-schema patterns/rules/templates.
+
+No LangChain. Uses httpx → Ollama /api/chat directly, consistent with llm_regex.py.
 """
 
 from __future__ import annotations
@@ -8,9 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Any
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
+import httpx
 
 from app.config import (
     AGENT2_MODEL,
@@ -18,6 +19,7 @@ from app.config import (
     LLM_MAX_CHARS,
     LLM_NUM_CTX,
     OLLAMA_BASE_URL,
+    OLLAMA_HTTP_TIMEOUT,
 )
 from app.schemas_agents import AgentArtifactEnvelope, ValidatedEntityOcr
 from app.services.agent_session_store import get_job
@@ -25,21 +27,65 @@ from app.services.agent_session_store import get_job
 logger = logging.getLogger(__name__)
 
 SYSTEM = """You are an expert extraction-schema author for banking and document OCR pipelines.
-You output ONLY valid JSON. No markdown fences. The root object must have keys: patterns, rules, templates, rationale.
+You output ONLY valid JSON — no markdown fences, no prose. The root object must have exactly
+these keys: patterns, rules, templates, rationale.
+
+Output schema mirrors the KB node schema:
+
+patterns  — array of objects, each with:
+  _id            string   snake_case unique identifier you invent
+  name           string
+  type           string   "regex" | "string" | "spacy"
+  regexPattern   string | null   Python 3 re syntax (double-escape backslashes in JSON)
+  stringPattern  string | null
+  source         string   "generated"
+  extracts_entity_id  string   matches the _id of the entity below
+
+rules  — array of objects, each with:
+  _id            string   snake_case unique identifier
+  name           string
+  ruleType       string
+  filtersJson    string   JSON-encoded filters dict
+  entityJson     string   JSON-encoded {"entityId": "<entity._id>"}
+  valueJson      string   JSON-encoded {"valuePattern": ["<pattern._id>"]}
+  keyJson        string   JSON-encoded {"keyPattern": ["<pattern._id>"], "keyEntity": []}
+  targets_entity_id  string
+
+templates  — array of objects, each with:
+  nerTemplateId  string   snake_case unique identifier
+  name           string
+  entity_settings  array of objects:
+    stableId     string
+    name         string
+    ner_rules    array of objects:
+      stableId          string
+      nerRuleType       string
+      name              string
+      connectionType    string | null
+      direction         string | null
+      valueMatchSettingJson  string   JSON-encoded match setting
+      keyMatchSettingJson    string | null
+
+entities  — array of objects for any NEW entities needed:
+  _id            string   snake_case
+  name           string
+  entityType     string   "single" | "compound"
+  dataType       string   text | date | amount | currency | number | email | phone | address | id | other
+
+rationale  — string explaining the choices made
 
 Rules:
-- Propose NEW pattern, rule, and template objects for this document family (they may not exist in the KB yet).
-- Use Python 3 `re` syntax in regex fields when applicable.
-- Use snake_case for new _id fields you invent.
-- If templates are too uncertain, return an empty templates array and put extraction logic in patterns and rules.
+- Reuse existing KB _id values when an entity is already covered; create new ones for gaps.
+- Use Python 3 re syntax only in regexPattern. Double-escape backslashes in JSON strings.
+- Use snake_case for all new _id / stableId fields.
+- If templates are uncertain, return an empty templates array and express logic in patterns + rules.
+- Return ONLY the JSON object — no commentary, no markdown.
 """
 
 
 def _truncate(s: str, n: int) -> str:
     s = s or ""
-    if len(s) <= n:
-        return s
-    return s[: n - 20] + "\n…(truncated)"
+    return s if len(s) <= n else s[: n - 20] + "\n…(truncated)"
 
 
 def _extract_json_object(raw: str) -> str:
@@ -52,6 +98,39 @@ def _extract_json_object(raw: str) -> str:
     if a != -1 and b > a:
         return t[a : b + 1]
     return t
+
+
+def _call_ollama(model_name: str, messages: list[dict[str, str]]) -> str:
+    """Synchronous Ollama /api/chat call — consistent with how llm_regex.py calls Ollama."""
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0.15, **({"num_ctx": LLM_NUM_CTX} if LLM_NUM_CTX > 0 else {})},
+    }
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    with httpx.Client(timeout=OLLAMA_HTTP_TIMEOUT) as client:
+        r = client.post(url, json=payload)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body = (e.response.text or "")[:4000]
+            raise ValueError(
+                f"Ollama HTTP {e.response.status_code} at {url}: {body or str(e)}"
+            ) from e
+        try:
+            data = r.json()
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Ollama /api/chat response was not JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError(f"Ollama /api/chat JSON was not an object: {data!r}")
+        msg = data.get("message")
+        if not isinstance(msg, dict):
+            raise ValueError(f"Ollama /api/chat missing message: {str(data)[:1200]!r}")
+        content = msg.get("content")
+        if content is None:
+            raise ValueError(f"Ollama /api/chat missing content: {str(data)[:1200]!r}")
+        return str(content)
 
 
 def run_agent2_synthesize(
@@ -78,45 +157,26 @@ def run_agent2_synthesize(
         )
     validated_block = "\n".join(validated_lines)
 
-    ocr_block = _truncate(ocr.full_text, LLM_MAX_CHARS)
-
-    user_msg = f"""OCR text (primary document):
----
-{ocr_block}
----
-
-Prior retrieval notes (from Agent 1 / KB search, may be truncated):
----
-{_truncate(discover_notes, 8000)}
----
-
-User-validated entity annotations (ground truth):
----
-{validated_block}
----
-
-{f"Additional instructions: {extra_instructions}" if extra_instructions.strip() else ""}
-
-Return a single JSON object with keys: patterns (array), rules (array), templates (array), rationale (string)."""
-
-    llm = ChatOllama(
-        base_url=OLLAMA_BASE_URL,
-        model=model_name,
-        temperature=0.15,
-        num_ctx=LLM_NUM_CTX if LLM_NUM_CTX > 0 else None,
+    user_msg = (
+        f"OCR text (primary document):\n---\n{_truncate(ocr.full_text, LLM_MAX_CHARS)}\n---\n\n"
+        f"Prior retrieval notes (from Agent 1 / KB search, may be truncated):\n---\n"
+        f"{_truncate(discover_notes, 8000)}\n---\n\n"
+        f"User-validated entity annotations (ground truth):\n---\n{validated_block}\n---\n\n"
+        + (f"Additional instructions: {extra_instructions}\n\n" if extra_instructions.strip() else "")
+        + "Return a single JSON object with keys: entities, patterns, rules, templates, rationale."
     )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [("system", SYSTEM), ("user", "{user}")]
-    )
-    chain = prompt | llm
-    msg = chain.invoke({"user": user_msg})
-    raw_text = getattr(msg, "content", None) or str(msg)
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": user_msg},
+    ]
+
+    raw_text = _call_ollama(model_name, messages)
 
     try:
         obj = json.loads(_extract_json_object(raw_text))
         env = AgentArtifactEnvelope.model_validate(obj)
         return env, raw_text, model_name
     except Exception as e:
-        logger.exception("Agent2 JSON parse failed")
+        logger.exception("Agent 2 JSON parse failed")
         raise ValueError(f"Agent 2 could not produce valid artifacts JSON: {e}") from e

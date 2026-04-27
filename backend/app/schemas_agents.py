@@ -9,6 +9,30 @@ from pydantic import BaseModel, Field
 from app.schemas import EntitySpec
 
 
+# ---------------------------------------------------------------------------
+# Step 1 — Ingest responses
+# ---------------------------------------------------------------------------
+
+
+class PdfUploadResponse(BaseModel):
+    """Response after uploading the PDF (used purely for rendering pages)."""
+
+    job_id: str
+    filename: str
+    page_count: int
+
+
+class AgentPageImageResponse(BaseModel):
+    """One rendered PDF page as a base64 PNG."""
+
+    job_id: str
+    page_num: int
+    total_pages: int
+    image_b64: str
+    width_px: int
+    height_px: int
+
+
 class KbMatchBrief(BaseModel):
     """One KB row suggested for an entity."""
 
@@ -80,8 +104,9 @@ class AgentSynthesizeRequest(BaseModel):
 
 
 class AgentArtifactEnvelope(BaseModel):
-    """Structured output from Agent 2 — mirrors your KB JSON shapes loosely."""
+    """Structured output from Agent 2 — matches exact KB node schema."""
 
+    entities: list[dict[str, Any]] = Field(default_factory=list)
     patterns: list[dict[str, Any]] = Field(default_factory=list)
     rules: list[dict[str, Any]] = Field(default_factory=list)
     templates: list[dict[str, Any]] = Field(default_factory=list)
@@ -93,4 +118,40 @@ class AgentSynthesizeResponse(BaseModel):
     artifacts: AgentArtifactEnvelope
     raw_model_text: str = ""
     ollama_model: str = ""
+    error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Preview extraction (apply patterns against OCR)
+# ---------------------------------------------------------------------------
+
+
+class PatternExtractionHit(BaseModel):
+    """One regex/string match found in the OCR text."""
+
+    pattern_id: str
+    pattern_type: str = Field(description="regex | string | spacy")
+    matched_text: str
+    line_text: str = Field(description="Full OCR line containing the match")
+    page: int = 1
+    char_offset: int = Field(default=0, description="Character offset within full_text")
+
+
+class EntityExtractionResult(BaseModel):
+    entity_id: str
+    entity_name: str
+    hits: list[PatternExtractionHit] = Field(default_factory=list)
+    matched: bool = False
+    no_pattern_reason: str = ""
+
+
+class AgentPreviewRequest(BaseModel):
+    job_id: str = Field(..., min_length=8)
+    artifacts: AgentArtifactEnvelope
+
+
+class AgentPreviewResponse(BaseModel):
+    job_id: str
+    results: list[EntityExtractionResult]
+    total_hits: int = 0
     error: str = ""

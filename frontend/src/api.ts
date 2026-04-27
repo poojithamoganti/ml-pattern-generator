@@ -244,6 +244,7 @@ export type ValidatedEntityOcr = {
 }
 
 export type AgentArtifactEnvelope = {
+  entities: Record<string, unknown>[]
   patterns: Record<string, unknown>[]
   rules: Record<string, unknown>[]
   templates: Record<string, unknown>[]
@@ -255,6 +256,30 @@ export type AgentSynthesizeResponse = {
   artifacts: AgentArtifactEnvelope
   raw_model_text: string
   ollama_model: string
+  error: string
+}
+
+export type PatternExtractionHit = {
+  pattern_id: string
+  pattern_type: string
+  matched_text: string
+  line_text: string
+  page: number
+  char_offset: number
+}
+
+export type EntityExtractionResult = {
+  entity_id: string
+  entity_name: string
+  hits: PatternExtractionHit[]
+  matched: boolean
+  no_pattern_reason: string
+}
+
+export type AgentPreviewResponse = {
+  job_id: string
+  results: EntityExtractionResult[]
+  total_hits: number
   error: string
 }
 
@@ -287,6 +312,18 @@ export async function agentSynthesize(body: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  })
+}
+
+export async function agentPreviewExtraction(body: {
+  job_id: string
+  artifacts: AgentArtifactEnvelope
+}): Promise<AgentPreviewResponse> {
+  return fetchJson(`${BASE}/api/agent/preview-extraction`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    timeoutMs: 60_000,
   })
 }
 
